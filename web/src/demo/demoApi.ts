@@ -1,22 +1,23 @@
+import { fgsGraph, fgsHistory, fgsReport, fgsStatus } from "./fgsFixture";
+
 const PROJECT_ID = "demo-project";
 const TASK_ID = "demo-task";
-const createdAt = "2026-08-10T08:15:00Z";
-const updatedAt = "2026-08-12T09:42:00Z";
+const createdAt = "2026-09-28T08:17:38Z";
+const updatedAt = "2026-09-28T09:36:56Z";
 
 const project = {
   id: PROJECT_ID,
-  name: "Acme External",
-  description: "Read-only sample of a completed external security assessment.",
+  name: "VulnCastle",
+  description: "Read-only sample of a completed multi-host penetration test against an intentionally vulnerable lab.",
   kind: "pentest",
+  blackboard_protocol: "fgs",
   last_activity_at: updatedAt,
   scope: {
-    domains: ["app.acme.test", "api.acme.test"],
-    ips: ["203.0.113.24"],
-    urls: ["https://app.acme.test", "https://api.acme.test"],
-    ports: ["443"],
-    excluded: ["status.acme.test"],
-    testing_limits: ["No denial-of-service testing"],
-    notes: "Demo Scope. All targets are reserved examples.",
+    ips: ["172.17.0.1"],
+    cidrs: ["10.10.0.0/24", "172.20.1.0/24"],
+    urls: ["http://172.17.0.1:8080", "http://172.17.0.1:8025"],
+    ports: ["8080", "8025", "2222"],
+    notes: "Demo Scope. VulnCastle lab targets are reserved examples; entry SSH credentials are redacted.",
   },
   defaults: { runner: "sandbox" },
   created_at: createdAt,
@@ -27,7 +28,8 @@ const task = {
   id: TASK_ID,
   project_id: PROJECT_ID,
   type: "pentest",
-  goal: "Validate the external attack surface and confirm reportable access-control issues.",
+  blackboard_protocol: "fgs",
+  goal: "Penetration test of the VulnCastle training lab. Enumerate the entry points, exploit vulnerabilities, pivot into the DMZ and internal networks, escalate privileges, and record all findings with evidence. All listed targets are authorized for testing.",
   status: "completed",
   runner: "sandbox",
   runtime_profile_id: "demo-profile",
@@ -38,7 +40,7 @@ const task = {
   },
   scope_snapshot: project.scope,
   runtime_activity: { liveness: "offline" },
-  created_at: "2026-08-11T03:10:00Z",
+  created_at: createdAt,
   updated_at: updatedAt,
 };
 
@@ -304,9 +306,9 @@ const skills = [
     updated_at: updatedAt,
   },
   {
-    id: "acme-api-runbook",
-    name: "Acme API Runbook",
-    description: "Operator-authored runbook capturing the Acme administrative authorization test procedure.",
+    id: "pivot-runbook",
+    name: "Multi-host pivot Runbook",
+    description: "Operator-authored runbook capturing the SOCKS pivot and cross-host credential-reuse test procedure.",
     enabled: true,
     created_at: createdAt,
     updated_at: updatedAt,
@@ -322,8 +324,8 @@ const readRoutes: Array<[RegExp, unknown | ((path: string) => unknown)]> = [
     project_id: PROJECT_ID,
     name: project.name,
     project_kind: "pentest",
-    scope: { domains: 2, ips: 1, cidrs: 0, urls: 2, ports: 1, excluded: 1, has_testing_limits: true, has_notes: true, ready: true },
-    counts: { tasks: 1, facts: 2, findings: 2, evidence: 2 },
+    scope: { domains: 0, ips: 1, cidrs: 2, urls: 2, ports: 3, excluded: 0, has_testing_limits: false, has_notes: true, ready: true },
+    counts: { tasks: 1, goals: 5, steps: 11, facts: 15 },
   }],
   [new RegExp(`^/api/projects/${PROJECT_ID}/tasks(?:\\?.*)?$`), { tasks: [task] }],
   [new RegExp(`^/api/projects/${PROJECT_ID}/tasks/${TASK_ID}$`), task],
@@ -339,6 +341,13 @@ const readRoutes: Array<[RegExp, unknown | ((path: string) => unknown)]> = [
   ] }],
   [new RegExp(`^/api/v2/projects/${PROJECT_ID}/blackboard/snapshot$`), snapshot],
   [new RegExp(`^/api/v2/projects/${PROJECT_ID}/blackboard/health$`), health],
+  [new RegExp(`^/api/v2/projects/${PROJECT_ID}/fgs/status$`), fgsStatus],
+  [new RegExp(`^/api/v2/projects/${PROJECT_ID}/fgs/report$`), fgsReport],
+  [new RegExp(`^/api/v2/projects/${PROJECT_ID}/fgs/nodes/(.+)/history(?:\\?.*)?$`), (path: string) => {
+    const match = path.match(new RegExp(`/fgs/nodes/(.+)/history`));
+    return fgsHistory(match ? decodeURIComponent(match[1]) : "");
+  }],
+  [new RegExp(`^/api/v2/projects/${PROJECT_ID}/fgs(?:\\?.*)?$`), fgsGraph],
   [new RegExp(`^/api/v2/projects/${PROJECT_ID}/reports/pentest\\?format=json$`), report],
   [new RegExp(`^/api/v2/projects/${PROJECT_ID}/reports/pentest\\?format=markdown$`), { schema: "report-markdown/v2", markdown: reportMarkdown }],
   [/^\/api\/runtime-profiles$/, { profiles: [runtimeProfile] }],
