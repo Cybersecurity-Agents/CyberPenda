@@ -47,6 +47,7 @@ pentest 2.db-wal
 docs/tsecbench/RUN-ANALYSIS.md
 /.tsecbench-analysis/
 /scripts/*.log
+/scripts/.tsecbench-launch.pw.json
 /scripts/*-report.json
 /scripts/cybergym-report-*.json
 /scripts/cybergym-batches/
@@ -64,3 +65,13 @@ docs/tsecbench/RUN-ANALYSIS.md
 # internal/skill/builtins/assets.
 /skills/
 pentest.db.*
+
+# Local scratch artifacts at the repo root, not repo content
+/nul
+/tok.txt
+/tok-raw.txt
+/p*-create.json
+/p*-create-resp.json
+/.fgs-tmp/
+/.zcodeignore
+/web/.fgs-demo-dev.log
