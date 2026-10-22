@@ -2,7 +2,7 @@
 
 Status: current behavior on the project-subtraction branch, 2026-09-08.
 
-Use [CONTEXT.md](../../CONTEXT.md) for domain terms. This document records current
+Use [GLOSSARY.md](../../GLOSSARY.md) for domain terms. This document records current
 product constraints and routes detailed work to the relevant specification.
 It supersedes older descriptions of the retired features listed below.
 
@@ -144,11 +144,3 @@ The Hosted image supports Codex, Claude Code, and Pi. Hermes is retired. Read th
 [Hosted guide](../tsecbench/README.md) and
 [troubleshooting guide](../tsecbench/TROUBLESHOOTING.md) for environment variables,
 model compatibility, compaction limits, delivery, and acceptance checks.
-
-## Prior decisions
-
-The [pre-compression snapshot](../history/2026-09-08-context-before-compression.md)
-preserves the former document exactly for decision tracing. It mixes current and
-superseded material, so it is not a current specification or a default read.
-Use [the documentation index](../README.md) to select the relevant current guide
-or ADR before consulting that snapshot.
