@@ -688,6 +688,7 @@ func (s *Service) applySession(ctx context.Context, sessionID, continuationID st
 		})
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	baseRevision := revision
 	kernel, err := applySemanticChangeSet(ctx, tx, revision, batch.Changes, now, semanticChangeBackend{
 		prepare: func(_ context.Context, _ *sql.Tx, change Change, index int) (Change, error) {
 			return change, validateSessionChangeCapability(change, index)
@@ -720,7 +721,11 @@ func (s *Service) applySession(ctx context.Context, sessionID, continuationID st
 		return ChangeResult{}, err
 	}
 	result := makeChangeResult(revision, kernel.ChangedRecords, kernel.ChangedRelations)
-	if err := s.persistSessionSnapshot(ctx, tx, sessionID, continuationID, now); err != nil {
+	snapshot, err := s.sessionSnapshotWithChangesTx(ctx, tx, sessionID, baseRevision, kernel)
+	if err != nil {
+		return ChangeResult{}, err
+	}
+	if err := s.persistSessionSnapshotValue(ctx, tx, sessionID, continuationID, now, snapshot); err != nil {
 		return ChangeResult{}, err
 	}
 	resultJSON, err := json.Marshal(result)
@@ -2074,6 +2079,10 @@ func (s *Service) persistSessionSnapshot(ctx context.Context, tx *sql.Tx, sessio
 	if err != nil {
 		return err
 	}
+	return s.persistSessionSnapshotValue(ctx, tx, sessionID, continuationID, now, snapshot)
+}
+
+func (s *Service) persistSessionSnapshotValue(ctx context.Context, tx *sql.Tx, sessionID, continuationID, now string, snapshot RuntimeSnapshot) error {
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("encode Session Working Snapshot: %w", err)
