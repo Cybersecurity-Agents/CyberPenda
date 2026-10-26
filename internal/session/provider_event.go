@@ -15,7 +15,7 @@ func (s *Service) AppendProviderEvent(sessionID string, kind EventKind, payload 
 	}
 	defer tx.Rollback()
 	var lifecycle, continuationID string
-	err = tx.QueryRow(`SELECT lifecycle,COALESCE((SELECT id FROM session_continuations WHERE session_id=sessions.id AND status IN ('pending','running','paused') ORDER BY number DESC LIMIT 1),'') FROM sessions WHERE id=?`, sessionID).Scan(&lifecycle, &continuationID)
+	err = tx.QueryRow(`SELECT lifecycle,COALESCE((SELECT id FROM session_continuations WHERE session_id=sessions.id AND status IN ('pending','running') ORDER BY number DESC LIMIT 1),'') FROM sessions WHERE id=?`, sessionID).Scan(&lifecycle, &continuationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Event{}, ErrNotFound
 	}
