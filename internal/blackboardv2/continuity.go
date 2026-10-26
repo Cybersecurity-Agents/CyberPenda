@@ -1141,6 +1141,9 @@ func materializeWorkingSnapshot(runtimeRoot, taskID string, data []byte) error {
 	if !safeTaskComponent(taskID) {
 		return fmt.Errorf("unsafe task-local path component")
 	}
+	if workingSnapshotMatches(runtimeRoot, taskID, data) {
+		return nil
+	}
 	if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
 		return fmt.Errorf("prepare Runtime Root: %w", err)
 	}
@@ -1224,4 +1227,44 @@ func CodexChecklist() string {
 		"4. Exploration flows through an open Attempt, reusable outcome records, and a terminal Attempt.",
 		"5. Blackboard scope labels never grant authorization, and Finish occurs only after every Attempt is terminal.",
 	}, "\n")
+}
+
+// workingSnapshotMatches is only an optimization. Any missing, unsafe, or
+// unreadable path goes through the existing confined publication path.
+func workingSnapshotMatches(runtimeRoot, taskID string, data []byte) bool {
+	root, err := os.OpenRoot(runtimeRoot)
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	current := root
+	opened := []*os.Root{}
+	defer func() {
+		for _, dir := range opened {
+			_ = dir.Close()
+		}
+	}()
+	for _, component := range []string{taskID, "workdir", ".pentest"} {
+		info, err := current.Lstat(component)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+		next, err := current.OpenRoot(component)
+		if err != nil {
+			return false
+		}
+		opened = append(opened, next)
+		current = next
+	}
+	info, err := current.Lstat("blackboard.json")
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() != int64(len(data)) {
+		return false
+	}
+	file, err := current.Open("blackboard.json")
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	existing, err := io.ReadAll(io.LimitReader(file, int64(len(data))+1))
+	return err == nil && bytes.Equal(existing, data)
 }
