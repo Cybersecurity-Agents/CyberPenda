@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"pentest/internal/keymutex"
 	"strings"
 	"sync"
 )
@@ -82,8 +83,10 @@ type HostSessionBridge struct {
 
 // HostSessionBridgeRegistry owns at most one host bridge per Task.
 type HostSessionBridgeRegistry struct {
-	mu      sync.Mutex
-	bridges map[string]*HostSessionBridge
+	lifecycle  sync.RWMutex
+	ownerLocks keymutex.Group
+	mu         sync.Mutex
+	bridges    map[string]*HostSessionBridge
 }
 
 func NewHostSessionBridgeRegistry() *HostSessionBridgeRegistry {
@@ -95,6 +98,10 @@ func (r *HostSessionBridgeRegistry) Bind(ctx context.Context, taskID, continuati
 	if taskID == "" || create == nil {
 		return nil, ErrHostBridgeInvalid
 	}
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	releaseOwner := r.ownerLocks.Lock(taskID)
+	defer releaseOwner()
 	r.mu.Lock()
 	if existing := r.bridges[taskID]; existing != nil {
 		r.mu.Unlock()
@@ -103,21 +110,20 @@ func (r *HostSessionBridgeRegistry) Bind(ctx context.Context, taskID, continuati
 		}
 		return existing, nil
 	}
+	r.mu.Unlock()
 	bridge, err := create()
 	if err != nil {
-		r.mu.Unlock()
 		return nil, err
 	}
 	if bridge.TaskID() != taskID {
-		r.mu.Unlock()
 		_ = bridge.Close(ctx)
 		return nil, ErrHostBridgeTaskMismatch
 	}
 	if err := bridge.BindContinuation(continuationID); err != nil {
-		r.mu.Unlock()
 		_ = bridge.Close(ctx)
 		return nil, err
 	}
+	r.mu.Lock()
 	r.bridges[taskID] = bridge
 	r.mu.Unlock()
 	return bridge, nil
@@ -131,6 +137,10 @@ func (r *HostSessionBridgeRegistry) Get(taskID string) (*HostSessionBridge, bool
 }
 
 func (r *HostSessionBridgeRegistry) CloseTask(ctx context.Context, taskID string) error {
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	releaseOwner := r.ownerLocks.Lock(strings.TrimSpace(taskID))
+	defer releaseOwner()
 	r.mu.Lock()
 	bridge := r.bridges[strings.TrimSpace(taskID)]
 	delete(r.bridges, strings.TrimSpace(taskID))
@@ -142,6 +152,8 @@ func (r *HostSessionBridgeRegistry) CloseTask(ctx context.Context, taskID string
 }
 
 func (r *HostSessionBridgeRegistry) CloseAll(ctx context.Context) error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.mu.Lock()
 	bridges := make([]*HostSessionBridge, 0, len(r.bridges))
 	for _, bridge := range r.bridges {
