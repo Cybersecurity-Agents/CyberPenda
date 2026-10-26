@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -1261,7 +1262,7 @@ func workingSnapshotMatchesWithSync(runtimeRoot, taskID string, data []byte, syn
 		current = next
 	}
 	info, err := current.Lstat("blackboard.json")
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() != int64(len(data)) {
+	if err != nil || !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) || info.Size() != int64(len(data)) {
 		return false
 	}
 	file, err := current.Open("blackboard.json")
