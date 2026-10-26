@@ -939,6 +939,7 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	runtimeCreatedAttempts := make(map[string]string)
 	dependentConfirmedFacts := make(map[string]string)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	baseRevision := revision
 	kernel, err := applySemanticChangeSet(ctx, tx, revision, batch.Changes, now, semanticChangeBackend{
 		prepare: func(ctx context.Context, tx *sql.Tx, change Change, index int) (Change, error) {
 			change, err := resolveChangeRedirects(ctx, tx, projectID, change)
@@ -1118,7 +1119,7 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 
 	workingAdvanced := false
 	if continuationID != "" {
-		_, _, workingAdvanced, err = s.advanceContinuationWorkingSnapshotTx(ctx, tx, projectID, continuationID)
+		_, _, workingAdvanced, err = s.advanceContinuationWorkingSnapshotTx(ctx, tx, projectID, continuationID, workingSnapshotChanges{baseRevision: baseRevision, records: kernel.ChangedRecords})
 		if err != nil {
 			return ChangeResult{}, err
 		}
@@ -1414,6 +1415,12 @@ func (s *Service) RuntimeSnapshot(ctx context.Context, projectID string) (Runtim
 }
 
 func (s *Service) runtimeSnapshotTx(ctx context.Context, tx *sql.Tx, projectID string) (RuntimeSnapshot, error) {
+	return s.runtimeSnapshotForKeysTx(ctx, tx, projectID, nil)
+}
+
+// A nil key set reads the full graph; a non-nil set reads only changed records.
+// Relationships still come from the same transaction and retain grammar checks.
+func (s *Service) runtimeSnapshotForKeysTx(ctx context.Context, tx *sql.Tx, projectID string, keys []string) (RuntimeSnapshot, error) {
 	if err := ensureProjectExists(ctx, tx, projectID); err != nil {
 		return RuntimeSnapshot{}, err
 	}
@@ -1421,12 +1428,20 @@ func (s *Service) runtimeSnapshotTx(ctx context.Context, tx *sql.Tx, projectID s
 	if err != nil {
 		return RuntimeSnapshot{}, err
 	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT key, type, version, record_json
-		FROM blackboard_v2_records
-		WHERE project_id = ? AND type IN ('entity', 'objective', 'attempt', 'fact', 'finding', 'solution', 'evidence')
-		ORDER BY key ASC`, projectID,
-	)
+	query := `SELECT key, type, version, record_json FROM blackboard_v2_records
+ WHERE project_id=? AND type IN ('entity','objective','attempt','fact','finding','solution','evidence')`
+	args := []any{projectID}
+	if keys != nil {
+		if len(keys) == 0 {
+			query += ` AND 0`
+		} else {
+			query += ` AND key IN (` + strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",") + `)`
+			for _, key := range keys {
+				args = append(args, key)
+			}
+		}
+	}
+	rows, err := tx.QueryContext(ctx, query+` ORDER BY key ASC`, args...)
 	if err != nil {
 		return RuntimeSnapshot{}, fmt.Errorf("read Blackboard v2 snapshot records: %w", err)
 	}
