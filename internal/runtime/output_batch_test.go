@@ -139,7 +139,7 @@ func TestOwnerHarnessFlushesOutputBeforePermissionAndFinalization(t *testing.T) 
 	}
 }
 
-func TestOwnerHarnessReportsBatchFailureAfterRetryWithoutLosingOutput(t *testing.T) {
+func TestOwnerHarnessReportsFailureAndRejectsLaterOutputAfterCancellation(t *testing.T) {
 	failure := errors.New("temporary atomic append failure")
 	calls := 0
 	var mu sync.Mutex
@@ -172,12 +172,27 @@ func TestOwnerHarnessReportsBatchFailureAfterRetryWithoutLosingOutput(t *testing
 	if !errors.Is(err, failure) {
 		t.Fatalf("original store error lost: %v", err)
 	}
-	if len(output) != 66 || terminalAt != 66 {
+	if len(output) != 32 || terminalAt != 32 {
 		t.Fatalf("outputs=%d terminal at=%d", len(output), terminalAt)
 	}
 	for i, text := range output {
 		if text != strconv.Itoa(i) {
 			t.Fatalf("row %d = %q", i, text)
 		}
+	}
+}
+
+func TestRuntimeOutputBatchRetainsOnlyBoundedFailedBatch(t *testing.T) {
+	failure := errors.New("write failed")
+	b := newRuntimeOutputBatch(func(string, []task.EventPayload) error { return failure }, func(error) {})
+	b.delay = time.Hour
+	for i := 0; i < 10000; i++ {
+		b.Append("one", task.EventPayload{"text": "line"})
+	}
+	if len(b.pending) != runtimeOutputBatchLimit || b.rejected != 10000-runtimeOutputBatchLimit {
+		t.Fatalf("pending=%d rejected=%d", len(b.pending), b.rejected)
+	}
+	if !errors.Is(b.Close(), failure) || !errors.Is(b.Err(), failure) {
+		t.Fatal("failure was not propagated")
 	}
 }

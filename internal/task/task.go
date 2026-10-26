@@ -905,6 +905,10 @@ func (s *Service) AppendEventTx(tx *sql.Tx, taskID string, kind EventKind, paylo
 // appendTaskEventTx stores one structured task event inside the caller-owned
 // transaction. Seq is assigned monotonically per task within the transaction.
 func appendTaskEventTx(tx *sql.Tx, taskID string, kind EventKind, payload EventPayload, now time.Time) (Event, error) {
+	return appendTaskContinuationEventTx(tx, taskID, "", kind, payload, now)
+}
+
+func appendTaskContinuationEventTx(tx *sql.Tx, taskID, continuationID string, kind EventKind, payload EventPayload, now time.Time) (Event, error) {
 	if payload == nil {
 		payload = EventPayload{}
 	}
@@ -917,11 +921,11 @@ func appendTaskEventTx(tx *sql.Tx, taskID string, kind EventKind, payload EventP
 		return Event{}, fmt.Errorf("read max seq: %w", err)
 	}
 	event := Event{
-		ID: newID(), TaskID: taskID, Kind: kind, Payload: payload, Seq: int(maxSeq.Int64) + 1, CreatedAt: now,
+		ID: newID(), TaskID: taskID, ContinuationID: continuationID, Kind: kind, Payload: payload, Seq: int(maxSeq.Int64) + 1, CreatedAt: now,
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO task_events (id, task_id, continuation_id, seq, kind, payload_json, created_at) VALUES (?, ?, NULLIF(?,''), ?, ?, ?, ?)`,
-		event.ID, event.TaskID, "", event.Seq, string(event.Kind), string(payloadJSON), event.CreatedAt.Format(time.RFC3339Nano),
+		event.ID, event.TaskID, event.ContinuationID, event.Seq, string(event.Kind), string(payloadJSON), event.CreatedAt.Format(time.RFC3339Nano),
 	); err != nil {
 		return Event{}, fmt.Errorf("store event: %w", err)
 	}

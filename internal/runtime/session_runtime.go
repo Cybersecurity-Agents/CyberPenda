@@ -44,6 +44,7 @@ func NewSessionHarness(sessions *session.Service) *SessionHarness {
 			_, err := sessions.AppendEvent(ownerID, mappedKind, mappedPayload)
 			return err
 		},
+		RegisterRuntimeOutputFlush: sessions.RegisterRuntimeOutputFlush,
 		AppendRuntimeOutputs: func(ownerID, continuationID string, payloads []task.EventPayload) error {
 			mapped := make([]session.EventPayload, 0, len(payloads))
 			for _, payload := range payloads {

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -22,6 +23,8 @@ type runtimeOutputBatch struct {
 	pending    []queuedRuntimeOutput
 	timer      *time.Timer
 	closed     bool
+	closeError error
+	rejected   int
 	firstError error
 	delay      time.Duration
 }
@@ -36,20 +39,34 @@ func (b *runtimeOutputBatch) Append(continuation string, payload task.EventPaylo
 	if b.closed {
 		return
 	}
-	copyPayload := make(task.EventPayload, len(payload))
-	for k, v := range payload {
-		copyPayload[k] = v
+	if b.firstError != nil {
+		b.rejected++
+		return
 	}
-	b.pending = append(b.pending, queuedRuntimeOutput{continuation, copyPayload})
 	size := 0
 	for _, p := range b.pending {
 		text, _ := p.payload["text"].(string)
 		size += len(text)
 	}
-	if len(b.pending) >= runtimeOutputBatchLimit || size >= runtimeOutputBatchBytes || (len(b.pending) > 1 && b.pending[0].continuation != continuation) {
+	text, _ := payload["text"].(string)
+	if len(b.pending) > 0 && (b.pending[0].continuation != continuation || size+len(text) > runtimeOutputBatchBytes) {
+		if err := b.flushLocked(); err != nil {
+			b.rejected++
+			return
+		}
+		size = 0
+	}
+
+	copyPayload := make(task.EventPayload, len(payload))
+	for k, v := range payload {
+		copyPayload[k] = v
+	}
+	b.pending = append(b.pending, queuedRuntimeOutput{continuation, copyPayload})
+	if len(b.pending) >= runtimeOutputBatchLimit || size+len(text) >= runtimeOutputBatchBytes {
 		_ = b.flushLocked()
 	}
-	if len(b.pending) > 0 && b.timer == nil {
+
+	if len(b.pending) > 0 && b.timer == nil && b.firstError == nil {
 		b.timer = time.AfterFunc(b.delay, func() {
 			b.mu.Lock()
 			defer b.mu.Unlock()
@@ -93,16 +110,29 @@ func (b *runtimeOutputBatch) flushLocked() error {
 	return nil
 }
 
-func (b *runtimeOutputBatch) Flush() error { b.mu.Lock(); defer b.mu.Unlock(); return b.flushLocked() }
+func (b *runtimeOutputBatch) Flush() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return b.closeError
+	}
+	return b.flushLocked()
+}
 func (b *runtimeOutputBatch) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	err := b.flushLocked()
+	if b.closed {
+		return b.closeError
+	}
+	b.closeError = b.flushLocked()
 	b.closed = true
-	return err
+	return b.closeError
 }
 func (b *runtimeOutputBatch) Err() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.firstError != nil && b.rejected > 0 {
+		return fmt.Errorf("Runtime output append failed; rejected %d later events after cancellation: %w", b.rejected, b.firstError)
+	}
 	return b.firstError
 }

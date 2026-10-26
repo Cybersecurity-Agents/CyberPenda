@@ -18,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -423,6 +424,8 @@ type Service struct {
 	workdirRoot    string
 	removeAll      func(string) error
 	terminalMarker ContinuationTerminalMarker
+	outputMu       sync.Mutex
+	outputFlushes  map[string]*outputFlushRegistration
 }
 
 // ContinuationTerminalMarker closes capabilities bound to a terminal Session
@@ -692,6 +695,9 @@ func (s *Service) ListLimited(lifecycle Lifecycle, limit int) ([]Session, error)
 // Rename updates only the Session Title and records the owner-local lifecycle
 // Event. Session identity and retained input are unchanged.
 func (s *Service) Rename(id, title string) (Session, error) {
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return Session{}, err
+	}
 	title = truncateTitle(strings.TrimSpace(title))
 	if title == "" {
 		return Session{}, ErrMissingTitle
@@ -731,6 +737,9 @@ func (s *Service) Restore(id string) (Session, error) {
 }
 
 func (s *Service) transition(id string, from, to Lifecycle, wrongState error, phase string) (Session, error) {
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return Session{}, err
+	}
 	found, err := s.Get(id)
 	if err != nil {
 		return Session{}, err
@@ -768,6 +777,9 @@ func (s *Service) transition(id string, from, to Lifecycle, wrongState error, ph
 // The Workdir is first quarantined under the managed root so a failed database
 // transaction can restore it without ever touching an arbitrary path.
 func (s *Service) Delete(id string) error {
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return err
+	}
 	found, err := s.Get(id)
 	if err != nil {
 		return err
@@ -1056,6 +1068,9 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 // activity. Conversation events are deliberately stored in the same durable
 // stream but are projected separately by Conversation and Timeline.
 func (s *Service) AppendEvent(id string, kind EventKind, payload EventPayload) (Event, error) {
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return Event{}, err
+	}
 	found, err := s.Get(id)
 	if err != nil {
 		return Event{}, err
@@ -1090,7 +1105,8 @@ func (s *Service) AppendEvent(id string, kind EventKind, payload EventPayload) (
 
 // AppendEventTx appends a structured session event inside a caller-owned
 // transaction so it can be committed atomically with another owner-neutral
-// record (for example a durable Accepted Steering request).
+// record (for example a durable Accepted Steering request). Call
+// FlushRuntimeOutputs before opening the caller-owned transaction.
 func (s *Service) AppendEventTx(tx *sql.Tx, sessionID string, kind EventKind, payload EventPayload) (Event, error) {
 	now := time.Now().UTC()
 	event, err := appendEventTx(tx, sessionID, kind, payload, now)
@@ -1149,6 +1165,9 @@ type PreparedConversationInput struct {
 // without writing Events. The caller must call Commit after its transaction
 // commits, or Rollback on every failure path.
 func (s *Service) PrepareConversationInput(id, continuationID, role, text string, input []Attachment) (*PreparedConversationInput, error) {
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return nil, err
+	}
 	role = strings.TrimSpace(role)
 	text = strings.TrimSpace(text)
 	if role == "" && len(input) == 0 {
@@ -1206,6 +1225,7 @@ func (prepared *PreparedConversationInput) AttachmentReferences() []AttachmentRe
 
 // AppendTx writes attachment and Conversation Events inside a caller-owned
 // transaction. It does not finalize the staged files.
+// AppendTx requires the caller to flush Runtime output before opening tx.
 func (prepared *PreparedConversationInput) AppendTx(tx *sql.Tx) ([]Event, Event, error) {
 	if prepared == nil || prepared.service == nil || prepared.finalized {
 		return nil, Event{}, errors.New("prepared Session conversation input is unavailable")
@@ -1276,6 +1296,9 @@ func (prepared *PreparedConversationInput) Rollback() {
 }
 
 func (s *Service) appendConversationInput(id, continuationID string, input []Attachment, role, text string) ([]Event, Event, error) {
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return nil, Event{}, err
+	}
 	prepared, err := s.PrepareConversationInput(id, continuationID, role, text, input)
 	if err != nil {
 		return nil, Event{}, err
@@ -1283,6 +1306,9 @@ func (s *Service) appendConversationInput(id, continuationID string, input []Att
 	defer prepared.Rollback()
 	if prepared.finalized {
 		return nil, Event{}, nil
+	}
+	if err := s.FlushRuntimeOutputs(id); err != nil {
+		return nil, Event{}, err
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1325,6 +1351,9 @@ func (s *Service) Conversation(id string) ([]Event, error) {
 // RecordRuntimeConfig stores the non-secret Runtime Turn Selection history for
 // a Session. Each explicit configuration change creates a new version.
 func (s *Service) RecordRuntimeConfig(sessionID, runtimeProfileID string, config map[string]any) (RuntimeConfigVersion, error) {
+	if err := s.FlushRuntimeOutputs(sessionID); err != nil {
+		return RuntimeConfigVersion{}, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return RuntimeConfigVersion{}, fmt.Errorf("begin Session Runtime config: %w", err)
@@ -1392,6 +1421,9 @@ func (s *Service) CreateContinuationWithInput(sessionID, runtimeProfileID, runti
 }
 
 func (s *Service) createContinuation(sessionID string, req CreateContinuationRequest, allowActive bool, input *ConversationInput) (Continuation, error) {
+	if err := s.FlushRuntimeOutputs(sessionID); err != nil {
+		return Continuation{}, err
+	}
 	if req.Runner != RunnerSandbox && req.Runner != RunnerHost {
 		return Continuation{}, ErrInvalidRunner
 	}
@@ -1442,6 +1474,9 @@ func (s *Service) createContinuation(sessionID string, req CreateContinuationReq
 		return Continuation{}, fmt.Errorf("encode Session launch Runtime config: %w", err)
 	}
 	now := time.Now().UTC()
+	if err := s.FlushRuntimeOutputs(sessionID); err != nil {
+		return Continuation{}, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Continuation{}, fmt.Errorf("begin Session continuation: %w", err)
@@ -1591,6 +1626,9 @@ func (s *Service) UpdateContinuationStatus(id string, status RuntimeStatus) (Con
 	}
 	found, err := s.Continuation(id)
 	if err != nil {
+		return Continuation{}, err
+	}
+	if err := s.FlushRuntimeOutputs(found.SessionID); err != nil {
 		return Continuation{}, err
 	}
 	if isTerminalRuntimeStatus(found.Status) {
