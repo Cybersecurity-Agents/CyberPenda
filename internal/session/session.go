@@ -868,6 +868,24 @@ func (s *Service) Events(id string) ([]Event, error) {
 	return scanEvents(rows)
 }
 
+// PermissionEvents returns only ordered permission requests and applied responses.
+// Runtime output and unrelated lifecycle payloads do not need to be decoded.
+func (s *Service) PermissionEvents(id string) ([]Event, error) {
+	if _, err := s.Get(id); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT id,session_id,seq,kind,payload_json,created_at
+ FROM session_events WHERE session_id=? AND kind IN ('permission','lifecycle')
+ AND json_extract(payload_json,'$.permission_request_id') IS NOT NULL
+ AND json_extract(payload_json,'$.phase') IN ('provider_permission_requested','provider_permission_response_applied')
+ ORDER BY seq ASC`, id)
+	if err != nil {
+		return nil, fmt.Errorf("list Session permission events: %w", err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
 // EventProjection selects the Session Event kinds needed by one Runtime Owner
 // history projection.
 type EventProjection string

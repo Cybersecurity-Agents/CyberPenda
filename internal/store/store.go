@@ -59,6 +59,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 
+	if err := ensurePerformanceIndexes(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &DB{db}, nil
 }
 
