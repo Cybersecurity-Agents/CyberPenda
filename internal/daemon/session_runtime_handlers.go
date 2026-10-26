@@ -991,7 +991,7 @@ func (server *Server) sessionCurrentSelection(continuation session.Continuation)
 }
 
 func (server *Server) sessionProviderPermissions(sessionID string) []session.ProviderPermission {
-	events, err := server.sessions.Events(sessionID)
+	events, err := server.sessions.PermissionEvents(sessionID)
 	if err != nil {
 		return nil
 	}
