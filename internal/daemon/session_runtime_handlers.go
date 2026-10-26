@@ -872,14 +872,16 @@ func (server *Server) stopSessionRuntime(sessionID string) error {
 // of waiting for a conclusion Turn whose provider session was intentionally
 // closed.
 func (server *Server) decorateSession(found session.Session) (session.Session, error) {
-	active, err := server.sessions.ActiveContinuation(found.ID)
+	decorated, err := server.decorateSessions([]session.Session{found})
 	if err != nil {
 		return session.Session{}, err
 	}
-	latest, err := server.sessions.LatestContinuation(found.ID)
-	if err != nil {
-		return session.Session{}, err
-	}
+	return decorated[0], nil
+}
+
+func (server *Server) decorateSessionFromData(found session.Session, data session.DecorationData, steeringControl steeringControlProjection) (session.Session, error) {
+	active, latest := data.Active, data.Latest
+	snapshot, snapshotErr := decodeRuntimeSnapshot(data.Config)
 	found.ActiveContinuation, found.LatestContinuation = active, latest
 	provider := ""
 	if latest != nil {
@@ -921,7 +923,15 @@ func (server *Server) decorateSession(found session.Session) (session.Session, e
 	controls.QueueSteerAvailable = controls.QueueSteerAvailable && runtimeSupported
 	if latest != nil {
 		controls.NativeSessionCaptured = latest.NativeSessionID != "" || latest.NativeSessionPath != ""
-		selection, selectionErr := server.sessionCurrentSelection(*latest)
+		selectionErr := snapshotErr
+		profile := runtimeprofile.Profile{}
+		if selectionErr == nil {
+			profile, selectionErr = runtimeProfileFromDecodedSnapshot(snapshot)
+		}
+		selection := runtime.ProviderSessionRequest{}
+		if selectionErr == nil {
+			selection, selectionErr = sessionSelection(profile, data.Config, sessionRuntimeInput{})
+		}
 		if selectionErr == nil {
 			controls.TurnSelection = &session.RuntimeTurnSelection{
 				ModelProviderID: selection.ModelProviderID, Model: selection.Model,
@@ -930,13 +940,10 @@ func (server *Server) decorateSession(found session.Session) (session.Session, e
 		}
 		controls.NativeResumeAvailable = runtimeSupported && active == nil && controls.NativeSessionCaptured && provider != string(runtimeprofile.ProviderFake)
 	}
-	steeringControl, steeringControlErr := server.latestSteeringControl(owner.KindSession, found.ID)
-	if steeringControlErr == nil {
-		controls.NativeSteerRequestID = steeringControl.requestID
-		controls.NativeSteerState = steeringControl.state
-		controls.NativeSteerErrorCode = steeringControl.errorCode
-		controls.NativeSteerError = steeringControl.error
-	}
+	controls.NativeSteerRequestID = steeringControl.requestID
+	controls.NativeSteerState = steeringControl.state
+	controls.NativeSteerErrorCode = steeringControl.errorCode
+	controls.NativeSteerError = steeringControl.error
 	if isBound {
 		capabilities := bound.Capabilities()
 		controls.QueueSteerAvailable = capabilities.SendTurn
@@ -961,13 +968,11 @@ func (server *Server) decorateSession(found session.Session) (session.Session, e
 		controls.RecoveryState = string(session.RuntimeStatusFailed)
 		controls.RecoveryReason = "previous Runtime launch failed; send a new message to retry with the saved profile"
 	}
-	controls.ProviderPermissions = server.sessionProviderPermissions(found.ID)
+	controls.ProviderPermissions = sessionProviderPermissionsFromEvents(data.PermissionEvents)
 	found.RuntimeControls = controls
-	if versions, versionErr := server.sessions.RuntimeConfigVersions(found.ID); versionErr == nil && len(versions) > 0 {
-		if snapshot, snapshotErr := decodeRuntimeSnapshot(versions[len(versions)-1].Config); snapshotErr == nil {
-			summary := runtimeconfig.Summarize(snapshot)
-			found.RuntimeConfiguration = &summary
-		}
+	if snapshotErr == nil {
+		summary := runtimeconfig.Summarize(snapshot)
+		found.RuntimeConfiguration = &summary
 	}
 	found.BlackboardConclusion.Mode = found.RunControls.BlackboardMode
 	found.BlackboardConclusion.State = session.BlackboardConclusionStateClean
@@ -995,6 +1000,10 @@ func (server *Server) sessionProviderPermissions(sessionID string) []session.Pro
 	if err != nil {
 		return nil
 	}
+	return sessionProviderPermissionsFromEvents(events)
+}
+
+func sessionProviderPermissionsFromEvents(events []session.Event) []session.ProviderPermission {
 	pending := map[string]session.ProviderPermission{}
 	for _, event := range events {
 		permissionID, _ := event.Payload["permission_request_id"].(string)

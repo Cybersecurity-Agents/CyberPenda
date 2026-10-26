@@ -153,6 +153,10 @@ func runtimeProfileFromSnapshot(config map[string]any) (runtimeprofile.Profile, 
 	if err != nil {
 		return runtimeprofile.Profile{}, err
 	}
+	return runtimeProfileFromDecodedSnapshot(snapshot)
+}
+
+func runtimeProfileFromDecodedSnapshot(snapshot runtimeconfig.RuntimeConfigurationSnapshot) (runtimeprofile.Profile, error) {
 	settings, _ := json.Marshal(snapshot.Settings)
 	var fields runtimeprofile.Fields
 	if err := json.Unmarshal(settings, &fields); err != nil {
