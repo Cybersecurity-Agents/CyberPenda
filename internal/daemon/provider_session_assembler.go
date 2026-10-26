@@ -102,9 +102,12 @@ func (f *ProductionProviderSessionFactory) openHostWithAssembler(ctx context.Con
 		return ProviderSessionBinding{}, fmt.Errorf("provider session bridge requires owner and Continuation identity")
 	}
 
+	releaseOwner := f.ownerLocks.Lock(taskID)
+	defer releaseOwner()
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if prior, ok := f.bounds[taskID]; ok {
+	prior, exists := f.bounds[taskID]
+	f.mu.Unlock()
+	if exists {
 		return f.rebindPrior(prior, request.Continuation.ID)
 	}
 
@@ -177,9 +180,12 @@ func (f *ProductionProviderSessionFactory) openSandboxWithAssembler(ctx context.
 		return ProviderSessionBinding{}, fmt.Errorf("provider session bridge requires owner and Continuation identity")
 	}
 
+	releaseOwner := f.ownerLocks.Lock(taskID)
+	defer releaseOwner()
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if prior, ok := f.bounds[taskID]; ok {
+	prior, exists := f.bounds[taskID]
+	f.mu.Unlock()
+	if exists {
 		return f.rebindPrior(prior, request.Continuation.ID)
 	}
 
@@ -237,7 +243,7 @@ func (f *ProductionProviderSessionFactory) openSandboxWithAssembler(ctx context.
 // finishProviderSessionBinding is the one shared binding tail for every
 // family and runner: bound-session wrapping with registry cleanup, the long
 // run adapter, continuation binding, restart metadata, and the durable
-// owner-scoped binding record. Called with f.mu held by the open flows.
+// owner-scoped binding record. Called with the owner lock held by the open flows.
 func (f *ProductionProviderSessionFactory) finishProviderSessionBinding(
 	ctx context.Context,
 	request ProviderSessionLaunchRequest,
@@ -251,6 +257,8 @@ func (f *ProductionProviderSessionFactory) finishProviderSessionBinding(
 ) (ProviderSessionBinding, error) {
 	var session runtime.ProviderSession
 	session = &productionBoundSession{ProviderSession: setup.Session, onClose: func(closeCtx context.Context) {
+		releaseOwner := f.ownerLocks.Lock(taskID)
+		defer releaseOwner()
 		f.mu.Lock()
 		if current, ok := f.bounds[taskID]; ok && current.Session == session {
 			delete(f.bounds, taskID)
@@ -270,6 +278,8 @@ func (f *ProductionProviderSessionFactory) finishProviderSessionBinding(
 		}
 	})
 	binding := ProviderSessionBinding{Session: session, Adapter: *runAdapter}
+	f.mu.Lock()
 	f.bounds[taskID] = binding
+	f.mu.Unlock()
 	return binding, nil
 }

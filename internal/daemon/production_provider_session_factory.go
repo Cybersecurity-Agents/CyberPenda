@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"pentest/internal/keymutex"
 	"strings"
 	"sync"
 
@@ -47,8 +48,9 @@ type ProductionProviderSessionFactory struct {
 	hostBridges *runtime.HostSessionBridgeRegistry
 	assemblers  map[runtimeprofile.Provider]providerSessionAssembler
 
-	mu     sync.Mutex
-	bounds map[string]ProviderSessionBinding
+	ownerLocks keymutex.Group
+	mu         sync.Mutex
+	bounds     map[string]ProviderSessionBinding
 }
 
 type claudeBridgeCapabilities struct {
