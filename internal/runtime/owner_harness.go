@@ -21,6 +21,7 @@ var ErrHarnessShutdown = fmt.Errorf("Runtime Harness shutdown: %w", context.Canc
 type OwnerHarnessConfig struct {
 	VerifyOwner                       func(string) error
 	AppendEvent                       func(string, string, task.EventKind, task.EventPayload) error
+	AppendRuntimeOutputs              func(string, string, []task.EventPayload) error
 	MarkRunning                       func(string, string) error
 	UpdateContinuationStatus          func(string, string) error
 	UpdateContinuationRuntimeMetadata func(string, string, string, string) error
@@ -61,7 +62,7 @@ func NewOwnerHarness(config OwnerHarnessConfig) *OwnerHarness {
 	return &OwnerHarness{config: config, active: map[string]*ownerActiveRun{}}
 }
 
-func (h *OwnerHarness) Launch(ctx context.Context, req OwnerLaunchRequest) error {
+func (h *OwnerHarness) Launch(ctx context.Context, req OwnerLaunchRequest) (launchErr error) {
 	if h == nil {
 		return fmt.Errorf("Runtime Harness is unavailable")
 	}
@@ -85,7 +86,26 @@ func (h *OwnerHarness) Launch(ctx context.Context, req OwnerLaunchRequest) error
 		close(run.done)
 	}()
 
+	var outputBatch *runtimeOutputBatch
+	if h.config.AppendRuntimeOutputs != nil {
+		outputBatch = newRuntimeOutputBatch(func(continuation string, payloads []task.EventPayload) error {
+			return h.config.AppendRuntimeOutputs(req.OwnerID, continuation, payloads)
+		}, func(error) { cancel() })
+		defer func() {
+			// Preserve persistence failures even on Finish and shutdown return paths.
+			launchErr = errors.Join(launchErr, outputBatch.Close(), outputBatch.Err())
+		}()
+	}
 	emit := func(kind task.EventKind, payload task.EventPayload) {
+		if outputBatch != nil {
+			if kind == task.EventKindRuntimeOutput {
+				outputBatch.Append(run.currentContinuationID(), payload)
+				return
+			}
+			if err := outputBatch.Flush(); err != nil {
+				return
+			}
+		}
 		if h.config.AppendEvent == nil {
 			return
 		}
@@ -108,6 +128,11 @@ func (h *OwnerHarness) Launch(ctx context.Context, req OwnerLaunchRequest) error
 	}
 
 	runErr := req.Adapter.Run(ctx, req.Goal, emit)
+	if outputBatch != nil {
+		if err := outputBatch.Close(); err != nil {
+			return fmt.Errorf("flush Runtime output before finalization: %w", err)
+		}
+	}
 	continuationID := run.currentContinuationID()
 	if continuationID != "" && req.Metadata != nil && h.config.UpdateContinuationRuntimeMetadata != nil {
 		if metadata, err := req.Metadata(); err == nil && (metadata.ContainerID != "" || metadata.NativeSessionID != "" || metadata.NativeSessionPath != "") {
@@ -139,7 +164,7 @@ func (h *OwnerHarness) Launch(ctx context.Context, req OwnerLaunchRequest) error
 		}
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return errors.Join(runErr, ctx.Err())
 	}
 	return runErr
 }

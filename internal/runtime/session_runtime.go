@@ -44,6 +44,20 @@ func NewSessionHarness(sessions *session.Service) *SessionHarness {
 			_, err := sessions.AppendEvent(ownerID, mappedKind, mappedPayload)
 			return err
 		},
+		AppendRuntimeOutputs: func(ownerID, continuationID string, payloads []task.EventPayload) error {
+			mapped := make([]session.EventPayload, 0, len(payloads))
+			for _, payload := range payloads {
+				_, p := mapSessionRuntimeEvent(task.EventKindRuntimeOutput, payload)
+				if continuationID != "" {
+					if _, exists := p["continuation_id"]; !exists {
+						p["continuation_id"] = continuationID
+					}
+				}
+				mapped = append(mapped, p)
+			}
+			_, err := sessions.AppendRuntimeOutputs(ownerID, mapped)
+			return err
+		},
 		MarkRunning: func(_, continuationID string) error {
 			if continuationID == "" {
 				return nil

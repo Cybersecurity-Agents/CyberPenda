@@ -2009,6 +2009,14 @@ func isTerminalRuntimeStatus(status RuntimeStatus) bool {
 }
 
 func appendEventTx(tx *sql.Tx, sessionID string, kind EventKind, payload EventPayload, now time.Time) (Event, error) {
+	var max sql.NullInt64
+	if err := tx.QueryRow(`SELECT MAX(seq) FROM session_events WHERE session_id=?`, sessionID).Scan(&max); err != nil {
+		return Event{}, fmt.Errorf("read Session Event sequence: %w", err)
+	}
+	return appendEventAtSequenceTx(tx, sessionID, kind, payload, now, int(max.Int64)+1)
+}
+
+func appendEventAtSequenceTx(tx *sql.Tx, sessionID string, kind EventKind, payload EventPayload, now time.Time, seq int) (Event, error) {
 	if payload == nil {
 		payload = EventPayload{}
 	}
@@ -2016,15 +2024,11 @@ func appendEventTx(tx *sql.Tx, sessionID string, kind EventKind, payload EventPa
 	if err != nil {
 		return Event{}, fmt.Errorf("encode Event payload: %w", err)
 	}
-	var max sql.NullInt64
-	if err := tx.QueryRow(`SELECT MAX(seq) FROM session_events WHERE session_id=?`, sessionID).Scan(&max); err != nil {
-		return Event{}, fmt.Errorf("read Session Event sequence: %w", err)
-	}
 	id, err := newID()
 	if err != nil {
 		return Event{}, fmt.Errorf("generate Session Event id: %w", err)
 	}
-	event := Event{ID: id, SessionID: sessionID, Seq: int(max.Int64) + 1, Kind: kind, Payload: payload, CreatedAt: now.UTC()}
+	event := Event{ID: id, SessionID: sessionID, Seq: seq, Kind: kind, Payload: payload, CreatedAt: now.UTC()}
 	if _, err := tx.Exec(`INSERT INTO session_events (id,session_id,seq,kind,payload_json,created_at) VALUES (?,?,?,?,?,?)`, event.ID, event.SessionID, event.Seq, string(event.Kind), string(encoded), formatTime(event.CreatedAt)); err != nil {
 		return Event{}, err
 	}
