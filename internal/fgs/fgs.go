@@ -210,7 +210,7 @@ func (s *Service) Apply(ctx context.Context, c owner.Contract, continuation stri
 			return Receipt{}, ErrBlocked
 		}
 	}
-	graph, err := readGraph(ctx, tx, kind, id)
+	graph, err := readUpdateGraph(ctx, tx, kind, id, u.Operations)
 	if err != nil {
 		return Receipt{}, err
 	}

@@ -64,3 +64,28 @@ func TestHistoryPagesReturnNewestVersionsFirst(t *testing.T) {
 		t.Fatalf("older: %+v %v", page, err)
 	}
 }
+
+func TestSparseUpdateRejectsNewChildrenOfCompletedGoal(t *testing.T) {
+	for _, op := range []fgs.Operation{
+		{Op: "goal.create", Key: "goal:new", ParentGoal: "goal:root", Title: "New", SuccessCriteria: "Checked"},
+		{Op: "step.create", Key: "step:new", Goal: "goal:root", Action: "Check again"},
+	} {
+		t.Run(op.Op, func(t *testing.T) {
+			s, c := fixture(t)
+			r := submit(t, s, c, 1,
+				fgs.Operation{Op: "goal.create", Key: "goal:root", Title: "Root", SuccessCriteria: "Checked"},
+				fgs.Operation{Op: "step.create", Key: "step:proof", Goal: "goal:root", Action: "Check"},
+				fgs.Operation{Op: "fact.append", Key: "fact:proof", Step: "step:proof", Summary: "Checked"},
+				fgs.Operation{Op: "step.transition", Key: "step:proof", From: "open", To: "done", Outputs: []string{"fact:proof"}},
+				fgs.Operation{Op: "goal.transition", Key: "goal:root", From: "open", To: "done", Facts: []string{"fact:proof"}, Summary: "Complete"},
+			)
+			if r.State != "applied" {
+				t.Fatalf("seed: %+v", r)
+			}
+			r = submit(t, s, c, 2, op)
+			if r.State != "action_required" || r.Code != "invalid_graph" {
+				t.Fatalf("completed ancestor accepted unfinished child: %+v", r)
+			}
+		})
+	}
+}
