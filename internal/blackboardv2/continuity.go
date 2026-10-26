@@ -1052,11 +1052,17 @@ func (s *ContinuityService) ActiveSnapshots(ctx context.Context) ([]ActiveSnapsh
 	return snapshots, rows.Err()
 }
 
-func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *sql.Tx, projectID, continuationID string) ([]byte, string, bool, error) {
+type workingSnapshotChanges struct {
+	baseRevision int
+	records      map[string]int
+}
+
+func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *sql.Tx, projectID, continuationID string, changes ...workingSnapshotChanges) ([]byte, string, bool, error) {
 	var taskID string
 	var previousRevision int
+	var previousBytes []byte
 	err := tx.QueryRowContext(ctx, `
-		SELECT c.task_id,state.last_acknowledged_revision
+		SELECT c.task_id,state.last_acknowledged_revision,state.working_snapshot_bytes
 		FROM task_continuations c
 		JOIN tasks t ON t.id=c.task_id
 		JOIN blackboard_v2_continuation_state state ON state.continuation_id=c.id
@@ -1065,7 +1071,7 @@ func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *
 			SELECT 1 FROM task_continuations newer
 			WHERE newer.task_id=c.task_id AND newer.number>c.number
 		  )`, continuationID, projectID,
-	).Scan(&taskID, &previousRevision)
+	).Scan(&taskID, &previousRevision, &previousBytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", false, nil
 	}
@@ -1081,7 +1087,7 @@ func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *
 		// its exact bytes and avoid a redundant publication after commit.
 		return nil, "", false, nil
 	}
-	projection, err := s.ProjectRuntimeSnapshotTx(ctx, tx, projectID)
+	projection, err := s.projectWorkingSnapshotTx(ctx, tx, projectID, previousRevision, previousBytes, changes)
 	if err != nil {
 		return nil, "", false, err
 	}
