@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 )
 
 type Registry struct {
@@ -27,8 +28,13 @@ func NewRegistry(plugins []Plugin) (*Registry, error) {
 	return registry, nil
 }
 
-func BuiltinRegistry() (*Registry, error) {
+var builtinRegistry = sync.OnceValues(func() (*Registry, error) {
 	return NewRegistry(BuiltinPlugins())
+})
+
+// BuiltinRegistry returns the immutable, process-wide built-in registry.
+func BuiltinRegistry() (*Registry, error) {
+	return builtinRegistry()
 }
 
 func MustBuiltinRegistry() *Registry {
@@ -87,6 +93,8 @@ func (r *Registry) IDs() []string {
 
 func clonePlugin(plugin Plugin) Plugin {
 	clone := plugin
+	clone.ConfigProjection.ManagedKeys = append([]ManagedKey(nil), plugin.ConfigProjection.ManagedKeys...)
+	clone.NativeResume.Args = append([]string(nil), plugin.NativeResume.Args...)
 	clone.ProfileSchema.Fields = append([]ProfileField(nil), plugin.ProfileSchema.Fields...)
 	clone.ModelProvider.SupportedProtocols = append([]string(nil), plugin.ModelProvider.SupportedProtocols...)
 	clone.ModelProvider.ProtocolPreference = append([]string(nil), plugin.ModelProvider.ProtocolPreference...)
