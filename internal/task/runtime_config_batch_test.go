@@ -25,7 +25,7 @@ func TestLatestRuntimeConfigsUsesLatestVersionAndRequestedOwners(t *testing.T) {
 	for _, row := range []struct {
 		id, owner, config string
 		version           int
-	}{{"one-old", one.ID, `{"runtime_plugin_id":"claude"}`, 1}, {"one-new", one.ID, `{"runtime_plugin_id":"codex"}`, 2}, {"two-config", two.ID, `{"runtime_plugin_id":"pi"}`, 1}} {
+	}{{"one-old", one.ID, `{"snapshot_version":1,"runtime_plugin_id":"claude"}`, 1}, {"one-new", one.ID, `{"snapshot_version":1,"runtime_plugin_id":"codex"}`, 2}, {"two-config", two.ID, `{"snapshot_version":1,"runtime_plugin_id":"pi"}`, 1}} {
 		_, err := db.Exec(`INSERT INTO task_runtime_config_versions(id,task_id,version,runtime_profile_id,config_json,created_at) VALUES(?,?,?,'',?,'2026-01-01T00:00:00Z')`, row.id, row.owner, row.version, row.config)
 		if err != nil {
 			t.Fatal(err)

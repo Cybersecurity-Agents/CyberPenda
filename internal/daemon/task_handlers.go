@@ -1392,14 +1392,24 @@ func (server *Server) handleWorkspaceNavigation(response http.ResponseWriter, re
 		if inlined == nil {
 			inlined = []task.Task{}
 		}
-		// Decorate each inlined Task through the same path as the per-Project
-		// Task list so runtime_activity is live and consistent.
-		inlined = server.attachRuntimeActivities(inlined)
 		summaries = append(summaries, workspaceNavigationProject{
 			Project:        current,
 			LastActivityAt: workspaceProjectActivity(current, inlined),
 			Tasks:          inlined,
 		})
+	}
+	// Resolve all inlined Task configurations in one batch across Projects.
+	var allTasks []task.Task
+	for _, summary := range summaries {
+		allTasks = append(allTasks, summary.Tasks...)
+	}
+	allTasks = server.attachRuntimeActivities(allTasks)
+	offset := 0
+	for index := range summaries {
+		count := len(summaries[index].Tasks)
+		copy(summaries[index].Tasks, allTasks[offset:offset+count])
+		offset += count
+		summaries[index].LastActivityAt = workspaceProjectActivity(summaries[index].Project, summaries[index].Tasks)
 	}
 	writeJSON(response, http.StatusOK, workspaceNavigationResponse{
 		Revision: revision,
