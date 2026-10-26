@@ -688,22 +688,6 @@ func (server *Server) recordLoopbackRewriteEvent(created task.Task) {
 	})
 }
 
-func (server *Server) buildTaskAdapter(created task.Task, launchModelOverride string) (runtime.Adapter, map[string]any, error) {
-	plan, err := server.buildTaskLaunchPlanWithBinding(created, created.Goal, launchModelOverride, "", "", nil, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	return plan.Adapter, plan.RuntimeConfig, nil
-}
-
-func (server *Server) buildTaskAdapterForGoal(created task.Task, goal string, launchModelOverride string) (runtime.Adapter, map[string]any, error) {
-	plan, err := server.buildTaskLaunchPlanWithBinding(created, goal, launchModelOverride, "", "", nil, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	return plan.Adapter, plan.RuntimeConfig, nil
-}
-
 func (server *Server) buildTaskLaunchPlan(created task.Task, goal string, launchModelOverride string, nativeResumeSessionID string, launchReasoningEffort string) (taskLaunchPlan, error) {
 	launch := resolveOwnerBlackboardRuntimeLaunch(
 		goal, created.RunControls.BlackboardMode == task.BlackboardModeDisabled,
@@ -1270,9 +1254,7 @@ func (server *Server) handleListTasks(response http.ResponseWriter, request *htt
 		tasks = []task.Task{}
 	}
 	// Decorate list entries with current Runtime Activity (not Task status).
-	for index := range tasks {
-		tasks[index] = server.attachRuntimeActivity(tasks[index])
-	}
+	tasks = server.attachRuntimeActivities(tasks)
 	writeJSON(response, http.StatusOK, struct {
 		Tasks []task.Task `json:"tasks"`
 	}{
@@ -1410,16 +1392,24 @@ func (server *Server) handleWorkspaceNavigation(response http.ResponseWriter, re
 		if inlined == nil {
 			inlined = []task.Task{}
 		}
-		// Decorate each inlined Task through the same path as the per-Project
-		// Task list so runtime_activity is live and consistent.
-		for index := range inlined {
-			inlined[index] = server.attachRuntimeActivity(inlined[index])
-		}
 		summaries = append(summaries, workspaceNavigationProject{
 			Project:        current,
 			LastActivityAt: workspaceProjectActivity(current, inlined),
 			Tasks:          inlined,
 		})
+	}
+	// Resolve all inlined Task configurations in one batch across Projects.
+	var allTasks []task.Task
+	for _, summary := range summaries {
+		allTasks = append(allTasks, summary.Tasks...)
+	}
+	allTasks = server.attachRuntimeActivities(allTasks)
+	offset := 0
+	for index := range summaries {
+		count := len(summaries[index].Tasks)
+		copy(summaries[index].Tasks, allTasks[offset:offset+count])
+		offset += count
+		summaries[index].LastActivityAt = workspaceProjectActivity(summaries[index].Project, summaries[index].Tasks)
 	}
 	writeJSON(response, http.StatusOK, workspaceNavigationResponse{
 		Revision: revision,
@@ -1571,8 +1561,8 @@ func (server *Server) decorateTask(found task.Task) (task.Task, error) {
 	if err != nil {
 		return task.Task{}, err
 	}
-	if versions, versionErr := server.tasks.RuntimeConfigVersions(found.ID); versionErr == nil && len(versions) > 0 {
-		if snapshot, snapshotErr := decodeRuntimeSnapshot(versions[len(versions)-1].Config); snapshotErr == nil {
+	if version, versionErr := server.tasks.LatestRuntimeConfig(found.ID); versionErr == nil && version != nil {
+		if snapshot, snapshotErr := decodeRuntimeSnapshot(version.Config); snapshotErr == nil {
 			summary := runtimeconfig.Summarize(snapshot)
 			found.RuntimeConfiguration = &summary
 		}
@@ -1641,7 +1631,7 @@ func (server *Server) runtimeControlsForTask(found task.Task, latest *task.TaskC
 			ReasoningEffort: selection.RequestedReasoningEffort,
 		}
 	}
-	if events, eventsErr := server.tasks.Events(found.ID); eventsErr == nil {
+	if events, eventsErr := server.tasks.RuntimeControlEvents(found.ID); eventsErr == nil {
 		if providerSessionBound {
 			controls.ProviderPermissions = providerPermissionRequestsForTask(events)
 		}
@@ -2138,10 +2128,6 @@ func (server *Server) handleFinishTask(response http.ResponseWriter, request *ht
 var errSemanticConclusionActionRequired = errors.New("semantic_conclusion_action_required")
 var errTaskControlOperationActive = errors.New("task control operation already active")
 
-func (server *Server) waitForWorkingGraphDrain(ctx context.Context, found task.Task) error {
-	return server.waitForWorkingGraphSettlement(ctx, found, false)
-}
-
 func (server *Server) waitForWorkingGraphSettlement(ctx context.Context, found task.Task, allowActionRequired bool) error {
 	if found.BlackboardProtocol == "fgs" && found.RunControls.BlackboardMode != task.BlackboardModeDisabled {
 		_, err := server.settleTaskWorkingGraph(ctx, found, allowActionRequired)
@@ -2291,13 +2277,6 @@ func (server *Server) providerTaskContext(taskID string) context.Context {
 	server.controlMu.Lock()
 	defer server.controlMu.Unlock()
 	return server.providerTaskContextLocked(taskID)
-}
-
-func (server *Server) hasLiveProviderTaskContext(taskID string) bool {
-	server.controlMu.Lock()
-	defer server.controlMu.Unlock()
-	ctx := server.providerTaskContexts[taskID]
-	return ctx != nil && ctx.Err() == nil
 }
 
 func (server *Server) cancelProviderTaskControls(taskID string) bool {
@@ -2697,11 +2676,6 @@ func (server *Server) taskResumeContextWithoutBlackboard(found task.Task) (strin
 		TaskGoal: found.Goal,
 		Steering: directives,
 	}), eventIDs, nil
-}
-
-func (server *Server) isCodexTask(found task.Task) bool {
-	profile, err := server.resolveTaskRuntimeProfile(found)
-	return err == nil && profile.Provider == runtimeprofile.ProviderCodex
 }
 
 func (server *Server) isBlackboardV2Task(found task.Task) bool {
@@ -3601,11 +3575,11 @@ func (server *Server) piProjectedProviderAllowed(found task.Task, providerID str
 }
 
 func (server *Server) projectedPiModelProviderIDs(found task.Task) []string {
-	versions, err := server.tasks.RuntimeConfigVersions(found.ID)
-	if err != nil || len(versions) == 0 {
+	latestVersion, err := server.tasks.LatestRuntimeConfig(found.ID)
+	if err != nil || latestVersion == nil {
 		return nil
 	}
-	snapshot, err := decodeRuntimeSnapshot(versions[len(versions)-1].Config)
+	snapshot, err := decodeRuntimeSnapshot(latestVersion.Config)
 	if err != nil {
 		return nil
 	}
@@ -3666,14 +3640,13 @@ func (server *Server) selectionFromCapturedRuntimeConfig(found task.Task) (runti
 }
 
 func (server *Server) selectionFromCapturedRuntimeConfigTimed(found task.Task) (runtime.ProviderSessionRequest, time.Time, error) {
-	versions, err := server.tasks.RuntimeConfigVersions(found.ID)
+	latestVersion, err := server.tasks.LatestRuntimeConfig(found.ID)
 	if err != nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, err
 	}
-	if len(versions) == 0 {
+	if latestVersion == nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, errors.New("runtime configuration snapshot is missing")
 	}
-	latestVersion := versions[len(versions)-1]
 	snapshot, err := decodeRuntimeSnapshot(latestVersion.Config)
 	if err != nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, err
@@ -3689,35 +3662,12 @@ func (server *Server) selectionFromCapturedRuntimeConfigTimed(found task.Task) (
 	}, latestVersion.CreatedAt, nil
 }
 
-func modelProviderSnapshotFields(raw any) (providerID, model string) {
-	switch snapshot := raw.(type) {
-	case map[string]any:
-		providerID = configString(snapshot, "model_provider_id")
-		model = configString(snapshot, "model")
-	case modelprovider.Snapshot:
-		providerID = strings.TrimSpace(snapshot.ModelProviderID)
-		model = strings.TrimSpace(snapshot.Model)
-	case *modelprovider.Snapshot:
-		if snapshot != nil {
-			providerID = strings.TrimSpace(snapshot.ModelProviderID)
-			model = strings.TrimSpace(snapshot.Model)
-		}
-	}
-	return providerID, model
-}
-
-func (server *Server) precedingConversationTurnSelection(taskID string) (runtime.ProviderSessionRequest, bool) {
-	selection, _, ok := server.precedingConversationTurnSelectionTimed(taskID)
-	return selection, ok
-}
-
 func (server *Server) precedingConversationTurnSelectionTimed(taskID string) (runtime.ProviderSessionRequest, time.Time, bool) {
-	events, err := server.tasks.Events(taskID)
-	if err != nil {
+	latest, err := server.tasks.LatestTurnSelectionEvent(taskID)
+	if err != nil || latest == nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, false
 	}
-	for index := len(events) - 1; index >= 0; index-- {
-		event := events[index]
+	for _, event := range []task.Event{*latest} {
 		// Selection is only read from existing conversation / steering turn
 		// records — never from a separate selection Task Event.
 		if event.Kind != task.EventKindConversation && event.Kind != task.EventKindSteering {
@@ -3750,31 +3700,6 @@ func (server *Server) precedingConversationTurnSelectionTimed(taskID string) (ru
 		}, event.CreatedAt, true
 	}
 	return runtime.ProviderSessionRequest{}, time.Time{}, false
-}
-
-func nativeSteerIdempotencyConflict(prior task.Event, message string, selection runtime.ProviderSessionRequest) string {
-	if priorText, _ := prior.Payload["text"].(string); priorText != message {
-		return "steer request id already belongs to a different message"
-	}
-	priorProvider, _ := prior.Payload["model_provider_id"].(string)
-	priorModel, _ := prior.Payload["model"].(string)
-	if priorModel == "" {
-		priorModel, _ = prior.Payload["model_override"].(string)
-	}
-	priorEffort, _ := prior.Payload["requested_reasoning_effort"].(string)
-	if priorEffort == "" {
-		priorEffort, _ = prior.Payload["reasoning_effort"].(string)
-	}
-	// Legacy conversation events may omit effort; treat missing as high so a
-	// retry that resolves to the default does not false-conflict.
-	priorEffortNormalized, _ := runtimeprofile.NormalizeReasoningEffort(priorEffort)
-	requestedEffortNormalized, _ := runtimeprofile.NormalizeReasoningEffort(selection.RequestedReasoningEffort)
-	if strings.TrimSpace(priorProvider) != strings.TrimSpace(selection.ModelProviderID) ||
-		strings.TrimSpace(priorModel) != strings.TrimSpace(selection.Model) ||
-		priorEffortNormalized != requestedEffortNormalized {
-		return "steer request id already belongs to a different turn selection"
-	}
-	return ""
 }
 
 func configString(config map[string]any, key string) string {
@@ -3863,14 +3788,14 @@ func (server *Server) resolveSelectedRuntimeProfile(response http.ResponseWriter
 }
 
 func (server *Server) resolveTaskRuntimeProfile(found task.Task) (runtimeprofile.Profile, error) {
-	versions, err := server.tasks.RuntimeConfigVersions(found.ID)
+	latestVersion, err := server.tasks.LatestRuntimeConfig(found.ID)
 	if err != nil {
 		return runtimeprofile.Profile{}, err
 	}
-	if len(versions) == 0 {
+	if latestVersion == nil {
 		return runtimeprofile.Profile{}, errors.New("runtime configuration snapshot is missing")
 	}
-	return runtimeProfileFromSnapshot(versions[len(versions)-1].Config)
+	return runtimeProfileFromSnapshot(latestVersion.Config)
 }
 
 func (server *Server) discoverNativeResumeSession(found task.Task) (runtime.NativeSessionMetadata, error) {
@@ -3923,71 +3848,6 @@ func (server *Server) discoverProviderNativeSession(taskID string, provider runt
 	default:
 		return runtime.NativeSessionMetadata{}, nil
 	}
-}
-
-func (server *Server) handleTaskContinuation(response http.ResponseWriter, request *http.Request) {
-	projectID := request.PathValue("id")
-	taskID := request.PathValue("task_id")
-	if !server.requireProject(response, projectID) {
-		return
-	}
-	if taskID == "" {
-		writeError(response, http.StatusNotFound, "task not found")
-		return
-	}
-
-	found, err := server.tasks.Get(taskID)
-	if err != nil {
-		writeTaskError(response, err)
-		return
-	}
-	if found.ProjectID != projectID {
-		writeError(response, http.StatusNotFound, "task not found")
-		return
-	}
-
-	configVersions, err := server.tasks.RuntimeConfigVersions(taskID)
-	if err != nil {
-		writeTaskError(response, err)
-		return
-	}
-	events, err := server.tasks.Events(taskID)
-	if err != nil {
-		writeError(response, http.StatusInternalServerError, "list task events")
-		return
-	}
-
-	type handoffPayload struct {
-		TaskID           string           `json:"task_id"`
-		ProjectID        string           `json:"project_id"`
-		Goal             string           `json:"goal"`
-		RuntimeProfileID string           `json:"runtime_profile_id"`
-		Runner           task.Runner      `json:"runner"`
-		ScopeDomains     []string         `json:"scope_domains"`
-		ScopeNotes       string           `json:"scope_notes"`
-		RunControls      task.RunControls `json:"run_controls"`
-		EventCount       int              `json:"event_count"`
-		ConfigVersions   int              `json:"config_versions"`
-	}
-
-	writeJSON(response, http.StatusOK, struct {
-		Mode    string         `json:"mode"`
-		Handoff handoffPayload `json:"handoff"`
-	}{
-		Mode: "mechanical_handoff",
-		Handoff: handoffPayload{
-			TaskID:           found.ID,
-			ProjectID:        found.ProjectID,
-			Goal:             found.Goal,
-			RuntimeProfileID: found.RuntimeProfileID,
-			Runner:           found.Runner,
-			ScopeDomains:     found.ScopeSnapshot.Domains,
-			ScopeNotes:       found.ScopeSnapshot.Notes,
-			RunControls:      found.RunControls,
-			EventCount:       len(events),
-			ConfigVersions:   len(configVersions),
-		},
-	})
 }
 
 // requireProject centralizes the project-exists check that every project-scoped

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"pentest/internal/keymutex"
 	"strings"
 	"sync"
 )
@@ -258,8 +259,10 @@ func (d DockerCLISandboxBridgeDocker) Remove(_ context.Context, containerID stri
 // Continuation returns the same bridge and therefore cannot create a second
 // provider container.
 type SandboxSessionBridgeRegistry struct {
-	mu      sync.Mutex
-	bridges map[string]*SandboxSessionBridge
+	lifecycle  sync.RWMutex
+	ownerLocks keymutex.Group
+	mu         sync.Mutex
+	bridges    map[string]*SandboxSessionBridge
 }
 
 func NewSandboxSessionBridgeRegistry() *SandboxSessionBridgeRegistry {
@@ -267,12 +270,16 @@ func NewSandboxSessionBridgeRegistry() *SandboxSessionBridgeRegistry {
 }
 
 // Bind stores the first bridge for a Task, or reuses the existing one. A bridge
-// created by a losing concurrent caller is closed before Bind returns.
+// is created once while other owners can bind independently.
 func (r *SandboxSessionBridgeRegistry) Bind(ctx context.Context, taskID, continuationID string, create func() (*SandboxSessionBridge, error)) (*SandboxSessionBridge, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" || create == nil {
 		return nil, ErrSandboxBridgeInvalid
 	}
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	releaseOwner := r.ownerLocks.Lock(taskID)
+	defer releaseOwner()
 	r.mu.Lock()
 	if existing := r.bridges[taskID]; existing != nil {
 		r.mu.Unlock()
@@ -281,21 +288,20 @@ func (r *SandboxSessionBridgeRegistry) Bind(ctx context.Context, taskID, continu
 		}
 		return existing, nil
 	}
+	r.mu.Unlock()
 	bridge, err := create()
 	if err != nil {
-		r.mu.Unlock()
 		return nil, err
 	}
 	if bridge.TaskID() != taskID {
-		r.mu.Unlock()
 		_ = bridge.Close(ctx)
 		return nil, ErrSandboxBridgeTaskMismatch
 	}
 	if err := bridge.BindContinuation(continuationID); err != nil {
-		r.mu.Unlock()
 		_ = bridge.Close(ctx)
 		return nil, err
 	}
+	r.mu.Lock()
 	r.bridges[taskID] = bridge
 	r.mu.Unlock()
 	return bridge, nil
@@ -311,6 +317,10 @@ func (r *SandboxSessionBridgeRegistry) Get(taskID string) (*SandboxSessionBridge
 // CloseTask drops ownership before cleanup, so no new control can acquire the
 // stale bridge while Docker shutdown is in progress.
 func (r *SandboxSessionBridgeRegistry) CloseTask(ctx context.Context, taskID string) error {
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	releaseOwner := r.ownerLocks.Lock(strings.TrimSpace(taskID))
+	defer releaseOwner()
 	r.mu.Lock()
 	bridge := r.bridges[strings.TrimSpace(taskID)]
 	delete(r.bridges, strings.TrimSpace(taskID))
@@ -324,6 +334,8 @@ func (r *SandboxSessionBridgeRegistry) CloseTask(ctx context.Context, taskID str
 // CloseAll fails closed on daemon shutdown/startup reconciliation by dropping
 // every in-memory owner and cleaning each provider container.
 func (r *SandboxSessionBridgeRegistry) CloseAll(ctx context.Context) error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.mu.Lock()
 	bridges := make([]*SandboxSessionBridge, 0, len(r.bridges))
 	for _, bridge := range r.bridges {

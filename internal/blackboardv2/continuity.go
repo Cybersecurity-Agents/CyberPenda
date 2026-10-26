@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -1024,22 +1025,6 @@ func (s *ContinuityService) MaterializeWorkingSnapshot(ctx context.Context, cont
 	return materializeWorkingSnapshot(s.runtimeRoot, taskID, state.Bytes)
 }
 
-// MaterializeLaunchPin verifies the immutable internal integrity before any
-// filesystem write and projects those exact bytes, never mutable working state.
-func (s *ContinuityService) MaterializeLaunchPin(ctx context.Context, continuationID string) error {
-	s.board.snapshotMu.Lock()
-	defer s.board.snapshotMu.Unlock()
-	var taskID string
-	if err := s.db.QueryRowContext(ctx, `SELECT task_id FROM task_continuations WHERE id=?`, continuationID).Scan(&taskID); err != nil {
-		return err
-	}
-	pin, err := s.ReadLaunchPin(ctx, continuationID)
-	if err != nil {
-		return err
-	}
-	return materializeWorkingSnapshot(s.runtimeRoot, taskID, pin.Bytes)
-}
-
 func (s *ContinuityService) ActiveSnapshots(ctx context.Context) ([]ActiveSnapshot, error) {
 	// Active recovery surfaces last-acknowledged Working Snapshot revision, not
 	// the immutable Launch Pin revision, so restart headers match disk bytes.
@@ -1067,27 +1052,17 @@ func (s *ContinuityService) ActiveSnapshots(ctx context.Context) ([]ActiveSnapsh
 	return snapshots, rows.Err()
 }
 
-// RecoverActiveWorkingSnapshots rematerializes each active Continuation's
-// persisted working_snapshot_bytes / last acknowledged revision. It never
-// overwrites a synchronized Working Snapshot with immutable Launch Pin bytes.
-func (s *ContinuityService) RecoverActiveWorkingSnapshots(ctx context.Context) error {
-	active, err := s.ActiveSnapshots(ctx)
-	if err != nil {
-		return err
-	}
-	for _, snapshot := range active {
-		if err := s.MaterializeWorkingSnapshot(ctx, snapshot.ContinuationID); err != nil {
-			return fmt.Errorf("recover Continuation Working Snapshot: %w", err)
-		}
-	}
-	return nil
+type workingSnapshotChanges struct {
+	baseRevision int
+	records      map[string]int
 }
 
-func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *sql.Tx, projectID, continuationID string) ([]byte, string, bool, error) {
+func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *sql.Tx, projectID, continuationID string, changes ...workingSnapshotChanges) ([]byte, string, bool, error) {
 	var taskID string
 	var previousRevision int
+	var previousBytes []byte
 	err := tx.QueryRowContext(ctx, `
-		SELECT c.task_id,state.last_acknowledged_revision
+		SELECT c.task_id,state.last_acknowledged_revision,state.working_snapshot_bytes
 		FROM task_continuations c
 		JOIN tasks t ON t.id=c.task_id
 		JOIN blackboard_v2_continuation_state state ON state.continuation_id=c.id
@@ -1096,14 +1071,23 @@ func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *
 			SELECT 1 FROM task_continuations newer
 			WHERE newer.task_id=c.task_id AND newer.number>c.number
 		  )`, continuationID, projectID,
-	).Scan(&taskID, &previousRevision)
+	).Scan(&taskID, &previousRevision, &previousBytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", false, nil
 	}
 	if err != nil {
 		return nil, "", false, fmt.Errorf("read owning Working Blackboard Snapshot: %w", err)
 	}
-	projection, err := s.ProjectRuntimeSnapshotTx(ctx, tx, projectID)
+	revision, err := currentRevision(ctx, tx, projectID)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if revision == previousRevision {
+		// The stored Working Snapshot already represents this revision. Keep
+		// its exact bytes and avoid a redundant publication after commit.
+		return nil, "", false, nil
+	}
+	projection, err := s.projectWorkingSnapshotTx(ctx, tx, projectID, previousRevision, previousBytes, changes)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -1163,6 +1147,9 @@ func materializeWorkingSnapshot(runtimeRoot, taskID string, data []byte) error {
 	}
 	if !safeTaskComponent(taskID) {
 		return fmt.Errorf("unsafe task-local path component")
+	}
+	if workingSnapshotMatches(runtimeRoot, taskID, data) {
+		return nil
 	}
 	if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
 		return fmt.Errorf("prepare Runtime Root: %w", err)
@@ -1247,4 +1234,50 @@ func CodexChecklist() string {
 		"4. Exploration flows through an open Attempt, reusable outcome records, and a terminal Attempt.",
 		"5. Blackboard scope labels never grant authorization, and Finish occurs only after every Attempt is terminal.",
 	}, "\n")
+}
+
+// workingSnapshotMatches is only an optimization. Any missing, unsafe, or
+// unreadable path goes through the existing confined publication path.
+func workingSnapshotMatches(runtimeRoot, taskID string, data []byte) bool {
+	return workingSnapshotMatchesWithSync(runtimeRoot, taskID, data, syncEvidenceDirectory)
+}
+
+func workingSnapshotMatchesWithSync(runtimeRoot, taskID string, data []byte, syncDirectory func(*os.Root) error) bool {
+	root, err := os.OpenRoot(runtimeRoot)
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	current := root
+	opened := []*os.Root{}
+	defer func() {
+		for _, dir := range opened {
+			_ = dir.Close()
+		}
+	}()
+	for _, component := range []string{taskID, "workdir", ".pentest"} {
+		info, err := current.Lstat(component)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+		next, err := current.OpenRoot(component)
+		if err != nil {
+			return false
+		}
+		opened = append(opened, next)
+		current = next
+	}
+	info, err := current.Lstat("blackboard.json")
+	if err != nil || !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) || info.Size() != int64(len(data)) {
+		return false
+	}
+	file, err := current.Open("blackboard.json")
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	existing, err := io.ReadAll(io.LimitReader(file, int64(len(data))+1))
+	// A prior rename may have succeeded before directory sync failed. Matching
+	// bytes do not prove that publication was durable, so retry directory sync.
+	return err == nil && bytes.Equal(existing, data) && syncDirectory(current) == nil
 }

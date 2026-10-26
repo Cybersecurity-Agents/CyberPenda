@@ -259,10 +259,6 @@ const (
 	BlackboardConclusionReceiptApplied                              = owner.BlackboardConclusionReceiptApplied
 )
 
-// SemanticDebtWatermarks compare terminal Work Tool Results with the latest
-// successful semantic persistence that covers them.
-type SemanticDebtWatermarks = owner.SemanticDebtWatermarks
-
 // ConclusionDispatchKind is the immutable attempt category of one Conclusion
 // Dispatch (ADR 0021). Recovery-created dispatches are kind recovery.
 type ConclusionDispatchKind = owner.ConclusionDispatchKind
@@ -308,106 +304,6 @@ const (
 	ConclusionRecoveryDispatchFailed                 = owner.ConclusionRecoveryDispatchFailed
 	ConclusionRecoveryLegacyCorrelationUnproven      = owner.ConclusionRecoveryLegacyCorrelationUnproven
 )
-
-// BlackboardConclusionReceipt is the durable coordinator record for one
-// completed assisted work Runtime Turn. Structured result bytes remain
-// internal and are never projected on Task APIs.
-type BlackboardConclusionReceipt struct {
-	ID                            string                           `json:"id"`
-	TaskID                        string                           `json:"task_id"`
-	ContinuationID                string                           `json:"continuation_id"`
-	SourceRequestID               string                           `json:"source_request_id"`
-	SourceRequestCorrelationExact bool                             `json:"source_request_correlation_exact"`
-	SourceSessionID               string                           `json:"source_session_id"`
-	SourceTurnID                  string                           `json:"source_turn_id"`
-	InternalState                 BlackboardConclusionReceiptState `json:"internal_state"`
-	SourceWorkWatermark           int                              `json:"source_work_watermark"`
-	SemanticPersistenceWatermark  int                              `json:"semantic_persistence_watermark"`
-	DispatchRequestID             string                           `json:"dispatch_request_id,omitempty"`
-	ControlTurnID                 string                           `json:"control_turn_id,omitempty"`
-	BaseRevision                  *int                             `json:"base_revision,omitempty"`
-	SynchronizedRevision          *int                             `json:"synchronized_revision,omitempty"`
-	SourceSelection               TurnSelection                    `json:"source_selection"`
-	CanonicalResultJSON           []byte                           `json:"-"`
-	CanonicalResultSHA256         string                           `json:"canonical_result_sha256,omitempty"`
-	ApplyIdempotencyKey           string                           `json:"apply_idempotency_key,omitempty"`
-	AppliedRevision               *int                             `json:"applied_revision,omitempty"`
-	AutomaticTurnCount            int                              `json:"automatic_turn_count"`
-	RepairCount                   int                              `json:"repair_count"`
-	VersionRegenerationCount      int                              `json:"version_regeneration_count"`
-	ExplicitRetryCount            int                              `json:"explicit_retry_count"`
-	OperatorRetryKey              string                           `json:"-"`
-	SendAttemptCount              int                              `json:"send_attempt_count"`
-	SendStartedAt                 *time.Time                       `json:"send_started_at,omitempty"`
-	NextEligibleAt                *time.Time                       `json:"next_eligible_at,omitempty"`
-	ErrorCode                     BlackboardConclusionErrorCode    `json:"error_code,omitempty"`
-	// RecoveryReason is the closed operator-visible reason for a fail-closed
-	// action_required obligation (ADR 0021). It is never free-form text.
-	RecoveryReason string `json:"recovery_reason,omitempty"`
-	// ActiveDispatchID and DispatchKind expose the active Conclusion Dispatch
-	// so recovery can create a new dispatch without rewriting history.
-	ActiveDispatchID    string                  `json:"-"`
-	DispatchKind        ConclusionDispatchKind  `json:"-"`
-	DirectiveKind       ConclusionDirectiveKind `json:"-"`
-	ValidationReason    string                  `json:"validation_reason,omitempty"`
-	ValidationFieldPath string                  `json:"validation_field_path,omitempty"`
-	ValidationExpected  string                  `json:"validation_expected,omitempty"`
-	CreatedAt           time.Time               `json:"created_at"`
-	UpdatedAt           time.Time               `json:"updated_at"`
-}
-
-// View projects internal coordinator progress into the compact Task API
-// vocabulary. Canonical result bytes and dispatch idempotency stay private.
-func (receipt BlackboardConclusionReceipt) View(mode BlackboardMode) BlackboardConclusion {
-	return receipt.ViewAt(mode, time.Now().UTC())
-}
-
-func (receipt BlackboardConclusionReceipt) ViewAt(mode BlackboardMode, now time.Time) BlackboardConclusion {
-	view := BlackboardConclusion{
-		Mode: mode, SourceTurnID: receipt.SourceTurnID,
-		SourceWorkWatermark:          receipt.SourceWorkWatermark,
-		SemanticPersistenceWatermark: receipt.SemanticPersistenceWatermark,
-	}
-	switch receipt.InternalState {
-	case BlackboardConclusionReceiptClean:
-		view.State = BlackboardConclusionStateClean
-	case BlackboardConclusionReceiptPending:
-		view.State = BlackboardConclusionStatePending
-	case BlackboardConclusionReceiptApplied:
-		view.State = BlackboardConclusionStateClean
-		if receipt.AppliedRevision != nil {
-			view.AppliedRevision = intPointer(*receipt.AppliedRevision)
-		}
-	case BlackboardConclusionReceiptActionRequired:
-		view.State = BlackboardConclusionStateActionRequired
-		view.ErrorCode = receipt.ErrorCode
-		view.RecoveryReason = receipt.RecoveryReason
-		view.ValidationReason = receipt.ValidationReason
-		view.ValidationFieldPath = receipt.ValidationFieldPath
-		view.ValidationExpected = receipt.ValidationExpected
-		if receipt.ErrorCode == BlackboardConclusionErrorWorkTurnNeverSettled {
-			// A never-settled work turn is terminal: retrying cannot win because
-			// the provider never yields the active turn. Surface it as not
-			// retryable so the operator is directed to Finish instead.
-			view.RetryAvailable = false
-			break
-		}
-		if receipt.RecoveryReason == string(ConclusionRecoveryAcceptanceAmbiguous) {
-			// An acceptance-ambiguous provider delivery is never resent: the
-			// obligation is terminal-actionable and offers no generic Retry.
-			view.RetryAvailable = false
-			break
-		}
-		if receipt.NextEligibleAt != nil {
-			eligible := receipt.NextEligibleAt.UTC()
-			view.NextEligibleAt = &eligible
-			view.RetryAvailable = !now.Before(eligible)
-		}
-	default:
-		view.State = BlackboardConclusionStateConcluding
-	}
-	return view
-}
 
 // RuntimeConfigVersion is a historical task-specific runtime configuration
 // captured for a runtime continuation. A runtime-profile switch inside a task
@@ -610,14 +506,6 @@ var ErrSandboxVPNTunHostProxyConflict = errors.New("sandbox VPN TUN cannot combi
 
 // ErrInvalidContainerCLI reports an unsupported Task-level container CLI choice.
 var ErrInvalidContainerCLI = errors.New("container CLI must be docker or podman")
-
-var ErrInvalidBlackboardConclusionReceipt = errors.New("invalid Blackboard conclusion checkpoint receipt")
-
-var ErrBlackboardConclusionRetryCooldown = errors.New("Blackboard conclusion retry is not yet eligible")
-
-// ErrBlackboardConclusionWorkTurnNeverSettled reports a retry against a
-// non-retryable terminal reached when a provider work turn never yielded.
-var ErrBlackboardConclusionWorkTurnNeverSettled = errors.New("Blackboard conclusion work turn never settled")
 
 // ErrContinuationStatusConflict prevents a late lifecycle observer from
 // overwriting a Continuation that already reached a different terminal state.
@@ -1017,6 +905,10 @@ func (s *Service) AppendEventTx(tx *sql.Tx, taskID string, kind EventKind, paylo
 // appendTaskEventTx stores one structured task event inside the caller-owned
 // transaction. Seq is assigned monotonically per task within the transaction.
 func appendTaskEventTx(tx *sql.Tx, taskID string, kind EventKind, payload EventPayload, now time.Time) (Event, error) {
+	return appendTaskContinuationEventTx(tx, taskID, "", kind, payload, now)
+}
+
+func appendTaskContinuationEventTx(tx *sql.Tx, taskID, continuationID string, kind EventKind, payload EventPayload, now time.Time) (Event, error) {
 	if payload == nil {
 		payload = EventPayload{}
 	}
@@ -1029,11 +921,11 @@ func appendTaskEventTx(tx *sql.Tx, taskID string, kind EventKind, payload EventP
 		return Event{}, fmt.Errorf("read max seq: %w", err)
 	}
 	event := Event{
-		ID: newID(), TaskID: taskID, Kind: kind, Payload: payload, Seq: int(maxSeq.Int64) + 1, CreatedAt: now,
+		ID: newID(), TaskID: taskID, ContinuationID: continuationID, Kind: kind, Payload: payload, Seq: int(maxSeq.Int64) + 1, CreatedAt: now,
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO task_events (id, task_id, continuation_id, seq, kind, payload_json, created_at) VALUES (?, ?, NULLIF(?,''), ?, ?, ?, ?)`,
-		event.ID, event.TaskID, "", event.Seq, string(event.Kind), string(payloadJSON), event.CreatedAt.Format(time.RFC3339Nano),
+		event.ID, event.TaskID, event.ContinuationID, event.Seq, string(event.Kind), string(payloadJSON), event.CreatedAt.Format(time.RFC3339Nano),
 	); err != nil {
 		return Event{}, fmt.Errorf("store event: %w", err)
 	}
@@ -1316,8 +1208,6 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 	}
 	return events, nil
 }
-
-func intPointer(value int) *int { return &value }
 
 // HarnessSteeringDirective is one unconsumed task-local directive selected in
 // Task Event order. EventID remains server authority and is never projected.
@@ -1771,47 +1661,9 @@ func (s *Service) TerminalContinuations() ([]TaskContinuation, error) {
 	return continuations, nil
 }
 
-// ActivePinnedContinuations returns Snapshot-pinned Continuations whose committed
-// task-local files may need regeneration after a daemon crash.
-func (s *Service) ActivePinnedContinuations() ([]TaskContinuation, error) {
-	rows, err := s.db.Query(
-		`SELECT `+continuationSelectColumns+`
-		 FROM task_continuations
-		 WHERE status IN (?,?,?) AND runtime_config_version_id IS NOT NULL
-		 ORDER BY started_at,id`,
-		string(StatusPending), string(StatusRunning), string(StatusPaused),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("query active pinned Continuations: %w", err)
-	}
-	defer rows.Close()
-	var continuations []TaskContinuation
-	for rows.Next() {
-		continuation, err := scanContinuation(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan active pinned Continuation: %w", err)
-		}
-		continuations = append(continuations, continuation)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate active pinned Continuations: %w", err)
-	}
-	return continuations, nil
-}
-
 // MarkContinuationReconciliation stores the durable outcome only after the
 // owning semantic reconciliation has completed.
 func (s *Service) MarkContinuationReconciliation(ctx context.Context, continuationID string, status ReconciliationStatus, mutationID string, reconciledAt time.Time) (TaskContinuation, error) {
-	return s.markContinuationReconciliation(ctx, continuationID, status, mutationID, reconciledAt, nil)
-}
-
-// MarkContinuationReconciliationWithEvent atomically stores the durable marker
-// and its compact system Task Event.
-func (s *Service) MarkContinuationReconciliationWithEvent(ctx context.Context, continuationID string, status ReconciliationStatus, mutationID string, reconciledAt time.Time, payload EventPayload) (TaskContinuation, error) {
-	return s.markContinuationReconciliation(ctx, continuationID, status, mutationID, reconciledAt, payload)
-}
-
-func (s *Service) markContinuationReconciliation(ctx context.Context, continuationID string, status ReconciliationStatus, mutationID string, reconciledAt time.Time, payload EventPayload) (TaskContinuation, error) {
 	if status != ReconciliationCompleted && status != ReconciliationFailed {
 		return TaskContinuation{}, fmt.Errorf("invalid Continuation reconciliation status %q", status)
 	}
@@ -1821,49 +1673,6 @@ func (s *Service) markContinuationReconciliation(ctx context.Context, continuati
 		return TaskContinuation{}, fmt.Errorf("begin Continuation reconciliation marker: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if payload != nil {
-		var taskID, currentStatus, currentMutationID string
-		if err := tx.QueryRowContext(ctx, `
-			SELECT task_id,blackboard_reconciliation_status,blackboard_reconciliation_mutation_id
-			FROM task_continuations WHERE id=?`, continuationID).Scan(&taskID, &currentStatus, &currentMutationID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return TaskContinuation{}, ErrNotFound
-			}
-			return TaskContinuation{}, fmt.Errorf("read reconciliation Event Task: %w", err)
-		}
-		payloadJSON, err := json.Marshal(payload)
-		if err != nil {
-			return TaskContinuation{}, fmt.Errorf("encode reconciliation Event: %w", err)
-		}
-		phase, _ := payload["phase"].(string)
-		if currentStatus == string(status) && currentMutationID == mutationID && phase != "" {
-			var storedPayloadJSON string
-			err := tx.QueryRowContext(ctx, `
-				SELECT payload_json FROM task_events
-				WHERE continuation_id=? AND kind=? AND json_extract(payload_json,'$.phase')=?
-				ORDER BY seq DESC,id DESC LIMIT 1`, continuationID, string(EventKindLifecycle), phase).Scan(&storedPayloadJSON)
-			if err == nil && storedPayloadJSON == string(payloadJSON) {
-				if err := tx.Commit(); err != nil {
-					return TaskContinuation{}, fmt.Errorf("commit repeated Continuation reconciliation: %w", err)
-				}
-				return s.Continuation(continuationID)
-			}
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return TaskContinuation{}, fmt.Errorf("read repeated reconciliation Event: %w", err)
-			}
-		}
-		var maxSeq sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM task_events WHERE task_id=?`, taskID).Scan(&maxSeq); err != nil {
-			return TaskContinuation{}, fmt.Errorf("read reconciliation Event sequence: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO task_events (id,task_id,continuation_id,seq,kind,payload_json,created_at)
-			VALUES (?,?,?,?,?,?,?)`,
-			newID(), taskID, continuationID, int(maxSeq.Int64)+1, string(EventKindLifecycle), string(payloadJSON), stamp,
-		); err != nil {
-			return TaskContinuation{}, fmt.Errorf("store reconciliation Event: %w", err)
-		}
-	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task_continuations
 		SET blackboard_reconciliation_status=?,blackboard_reconciliation_mutation_id=?,blackboard_reconciled_at=?,updated_at=?
@@ -2045,28 +1854,6 @@ func (s *Service) UpdateStatus(taskID string, status Status) (Task, error) {
 		return Task{}, fmt.Errorf("update status: %w", err)
 	}
 	return found, nil
-}
-
-// ReconcileInterruptedStatuses marks every task in an active state (running,
-// created, paused) as interrupted. It is intended to run at daemon startup:
-// those tasks belonged to a previous daemon instance whose in-memory harness
-// state is gone, so nothing is actually running them. It returns the tasks it
-// changed so the caller can log and emit lifecycle events.
-func (s *Service) ReconcileInterruptedStatuses() ([]Task, error) {
-	result, err := s.ReconcileInterruptedState()
-	if err != nil {
-		return result.Tasks, err
-	}
-	return result.Tasks, nil
-}
-
-// ReconcileInterruptedState marks every task and continuation in an active
-// state as interrupted. It is intended to run at daemon startup: those runtime
-// records belonged to a previous daemon instance whose in-memory harness state
-// is gone. It returns the records it changed so callers can log and clean up
-// runtime-owned resources such as sandbox containers.
-func (s *Service) ReconcileInterruptedState() (ReconcileInterruptedResult, error) {
-	return s.ReconcileInterruptedStateExcept(nil)
 }
 
 // ReconcileInterruptedStateExcept preserves Tasks whose Runtime ownership was

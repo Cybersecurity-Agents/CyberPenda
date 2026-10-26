@@ -938,11 +938,18 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	runtimeConfirmedFacts := make(map[string]string)
 	runtimeCreatedAttempts := make(map[string]string)
 	dependentConfirmedFacts := make(map[string]string)
+	affectedConclusions := make(map[string]bool)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	baseRevision := revision
 	kernel, err := applySemanticChangeSet(ctx, tx, revision, batch.Changes, now, semanticChangeBackend{
 		prepare: func(ctx context.Context, tx *sql.Tx, change Change, index int) (Change, error) {
 			change, err := resolveChangeRedirects(ctx, tx, projectID, change)
 			if err != nil {
+				return Change{}, err
+			}
+			// Capture dependents before destructive changes remove their support
+			// edges (supersede/merge/unrelate), and include each explicit target.
+			if err := collectAffectedConclusions(ctx, tx, projectID, []string{change.Key, change.From, change.To, change.Source, change.Canonical, change.Replaced, change.Replacement}, affectedConclusions); err != nil {
 				return Change{}, err
 			}
 			if change.Op == "transition" && isOneOf(change.Status, "verified", "rejected") {
@@ -1109,16 +1116,31 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	if err := s.validateDependentConfirmedFactBases(ctx, tx, projectID, dependentConfirmedFacts); err != nil {
 		return ChangeResult{}, err
 	}
-	if err := validateAllConfirmedFindings(ctx, tx, projectID); err != nil {
+	changedKeys := make([]string, 0, len(kernel.ChangedRecords)+2*len(kernel.ChangedRelations))
+	for key := range kernel.ChangedRecords {
+		changedKeys = append(changedKeys, key)
+	}
+	for _, tuple := range kernel.ChangedRelations {
+		changedKeys = append(changedKeys, fmt.Sprint(tuple[0]), fmt.Sprint(tuple[2]))
+	}
+	if err := collectAffectedConclusions(ctx, tx, projectID, changedKeys, affectedConclusions); err != nil {
 		return ChangeResult{}, err
 	}
-	if err := validateAllVerifiedSolutions(ctx, tx, projectID); err != nil {
+	conclusionKeys := make([]string, 0, len(affectedConclusions))
+	for key := range affectedConclusions {
+		conclusionKeys = append(conclusionKeys, key)
+	}
+	sort.Strings(conclusionKeys)
+	if err := validateConfirmedFindings(ctx, tx, projectID, conclusionKeys); err != nil {
+		return ChangeResult{}, err
+	}
+	if err := validateVerifiedSolutions(ctx, tx, projectID, conclusionKeys); err != nil {
 		return ChangeResult{}, err
 	}
 
 	workingAdvanced := false
 	if continuationID != "" {
-		_, _, workingAdvanced, err = s.advanceContinuationWorkingSnapshotTx(ctx, tx, projectID, continuationID)
+		_, _, workingAdvanced, err = s.advanceContinuationWorkingSnapshotTx(ctx, tx, projectID, continuationID, workingSnapshotChanges{baseRevision: baseRevision, records: kernel.ChangedRecords})
 		if err != nil {
 			return ChangeResult{}, err
 		}
@@ -1140,8 +1162,8 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	}
 	s.writeMu.Unlock()
 	writeLocked = false
-	if workingAdvanced {
-		if s.publicationFail != nil {
+	if continuationID != "" {
+		if workingAdvanced && s.publicationFail != nil {
 			if err := s.publicationFail(SnapshotPublicationAfterCommit, continuationID); err != nil {
 				return ChangeResult{}, err
 			}
@@ -1227,38 +1249,6 @@ func (s *Service) ReadCurrent(ctx context.Context, projectID, key string) (Curre
 		Record:        found.record,
 		Relationships: relationships,
 	}, nil
-}
-
-// HasSemanticKey reports whether a Blackboard Key is current, historical, or
-// retained as a redirect endpoint. It lets trusted adapters reject a new
-// record identity before a semantic batch can create a duplicate.
-func (s *Service) HasSemanticKey(ctx context.Context, projectID, key string) (bool, error) {
-	if err := validateKey(key, "key"); err != nil {
-		return false, err
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return false, fmt.Errorf("begin Blackboard v2 key lookup: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := ensureProjectExists(ctx, tx, projectID); err != nil {
-		return false, err
-	}
-	var exists int
-	err = tx.QueryRowContext(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM blackboard_v2_records WHERE project_id = ? AND key = ?
-			UNION ALL
-			SELECT 1 FROM blackboard_v2_record_history WHERE project_id = ? AND key = ?
-			UNION ALL
-			SELECT 1 FROM blackboard_v2_key_redirects
-			WHERE project_id = ? AND (source_key = ? OR canonical_key = ?)
-		)`, projectID, key, projectID, key, projectID, key, key,
-	).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("read Blackboard v2 key existence: %w", err)
-	}
-	return exists == 1, nil
 }
 
 // ReadHistory reads prior semantic versions by key with cursor pagination.
@@ -1446,6 +1436,12 @@ func (s *Service) RuntimeSnapshot(ctx context.Context, projectID string) (Runtim
 }
 
 func (s *Service) runtimeSnapshotTx(ctx context.Context, tx *sql.Tx, projectID string) (RuntimeSnapshot, error) {
+	return s.runtimeSnapshotForKeysTx(ctx, tx, projectID, nil)
+}
+
+// A nil key set reads the full graph; a non-nil set reads only changed records.
+// Relationships still come from the same transaction and retain grammar checks.
+func (s *Service) runtimeSnapshotForKeysTx(ctx context.Context, tx *sql.Tx, projectID string, keys []string) (RuntimeSnapshot, error) {
 	if err := ensureProjectExists(ctx, tx, projectID); err != nil {
 		return RuntimeSnapshot{}, err
 	}
@@ -1453,12 +1449,20 @@ func (s *Service) runtimeSnapshotTx(ctx context.Context, tx *sql.Tx, projectID s
 	if err != nil {
 		return RuntimeSnapshot{}, err
 	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT key, type, version, record_json
-		FROM blackboard_v2_records
-		WHERE project_id = ? AND type IN ('entity', 'objective', 'attempt', 'fact', 'finding', 'solution', 'evidence')
-		ORDER BY key ASC`, projectID,
-	)
+	query := `SELECT key, type, version, record_json FROM blackboard_v2_records
+ WHERE project_id=? AND type IN ('entity','objective','attempt','fact','finding','solution','evidence')`
+	args := []any{projectID}
+	if keys != nil {
+		if len(keys) == 0 {
+			query += ` AND 0`
+		} else {
+			query += ` AND key IN (` + strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",") + `)`
+			for _, key := range keys {
+				args = append(args, key)
+			}
+		}
+	}
+	rows, err := tx.QueryContext(ctx, query+` ORDER BY key ASC`, args...)
 	if err != nil {
 		return RuntimeSnapshot{}, fmt.Errorf("read Blackboard v2 snapshot records: %w", err)
 	}
@@ -2801,92 +2805,46 @@ func relationshipWouldCycle(ctx context.Context, tx *sql.Tx, projectID, relation
 	if fromKey == toKey {
 		return true, nil
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT to_key
-			FROM blackboard_v2_relationships
-			WHERE project_id = ? AND from_key = ? AND relation = ?
-			ORDER BY to_key ASC`,
-			projectID, key, relation,
-		)
-		if err != nil {
-			return false, fmt.Errorf("read %s relationships: %w", relation, err)
-		}
-		for rows.Next() {
-			var parent string
-			if err := rows.Scan(&parent); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan %s relationships: %w", relation, err)
-			}
-			stack = append(stack, parent)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate %s relationships: %w", relation, err)
-		}
-		rows.Close()
+	// UNION (not UNION ALL) visits each key once, even if retained data has a cycle.
+	// Read through the caller's transaction so earlier changes in this batch count.
+	var cycle bool
+	err := tx.QueryRowContext(ctx, `
+  WITH RECURSIVE reachable(key) AS (
+   SELECT ?
+   UNION
+   SELECT rel.to_key FROM reachable
+   CROSS JOIN blackboard_v2_relationships AS rel
+   WHERE rel.from_key = reachable.key AND rel.project_id = ? AND rel.relation = ?
+  )
+  SELECT EXISTS(SELECT 1 FROM reachable WHERE key = ?)`, toKey, projectID, relation, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read %s relationship reachability: %w", relation, err)
 	}
-	return false, nil
+	return cycle, nil
 }
 
 func factSupportsWouldCycle(ctx context.Context, tx *sql.Tx, projectID, fromKey, toKey string) (bool, error) {
 	if fromKey == toKey {
 		return true, nil
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT rel.to_key
-			FROM blackboard_v2_relationships AS rel
-			JOIN blackboard_v2_records AS source
-			  ON source.project_id = rel.project_id AND source.key = rel.from_key AND source.type = 'fact'
-			JOIN blackboard_v2_records AS target
-			  ON target.project_id = rel.project_id AND target.key = rel.to_key AND target.type = 'fact'
-			WHERE rel.project_id = ? AND rel.from_key = ? AND rel.relation = 'supports'
-			ORDER BY rel.to_key ASC`,
-			projectID, key,
-		)
-		if err != nil {
-			return false, fmt.Errorf("read Fact supports relationships: %w", err)
-		}
-		for rows.Next() {
-			var target string
-			if err := rows.Scan(&target); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan Fact supports relationship: %w", err)
-			}
-			stack = append(stack, target)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate Fact supports relationships: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return false, fmt.Errorf("close Fact supports relationships: %w", err)
-		}
+	var cycle bool
+	err := tx.QueryRowContext(ctx, `
+  WITH RECURSIVE reachable(key) AS (
+   SELECT ?
+   UNION
+   SELECT rel.to_key FROM reachable
+   CROSS JOIN blackboard_v2_relationships AS rel
+   JOIN blackboard_v2_records AS source
+    ON source.project_id = rel.project_id AND source.key = rel.from_key AND source.type = 'fact'
+   JOIN blackboard_v2_records AS target
+    ON target.project_id = rel.project_id AND target.key = rel.to_key AND target.type = 'fact'
+   WHERE rel.from_key = reachable.key AND rel.project_id = ? AND rel.relation = 'supports'
+  )
+  SELECT EXISTS(SELECT 1 FROM reachable WHERE key = ?)`, toKey, projectID, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read Fact supports reachability: %w", err)
 	}
-	return false, nil
+	return cycle, nil
 }
 
 func moveCurrentRelationshipsToHistory(ctx context.Context, tx *sql.Tx, projectID, key, recordedAt string) error {

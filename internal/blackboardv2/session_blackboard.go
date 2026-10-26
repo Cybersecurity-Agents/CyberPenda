@@ -97,19 +97,6 @@ func (s *Service) ApplyForSessionContinuation(ctx context.Context, sessionID, co
 	return s.applySession(ctx, sessionID, continuationID, nil, batch)
 }
 
-// ApplyForSessionContinuationAtRevision is the Session counterpart to the
-// Project Runtime optimistic-concurrency entry point. Exact replays are
-// resolved before the base-revision precondition inside applySession.
-func (s *Service) ApplyForSessionContinuationAtRevision(ctx context.Context, sessionID, continuationID string, expectedBaseRevision int, batch ChangeBatch) (ChangeResult, error) {
-	if strings.TrimSpace(continuationID) == "" {
-		return ChangeResult{}, semanticError("authority_denied", "trusted Continuation identity is required", "", nil)
-	}
-	if expectedBaseRevision < 0 {
-		return ChangeResult{}, semanticError("semantic_validation", "base_revision must not be negative", "base_revision", nil)
-	}
-	return s.applySession(ctx, sessionID, continuationID, &expectedBaseRevision, batch)
-}
-
 // ReadSessionCurrent reads current Session-owned semantic state by local Key.
 func (s *Service) ReadSessionCurrent(ctx context.Context, sessionID, key string) (CurrentDetail, error) {
 	if err := validateKey(key, "key"); err != nil {
@@ -142,37 +129,6 @@ func (s *Service) ReadSessionCurrent(ctx context.Context, sessionID, key string)
 		Schema: recordSchema, Revision: revision, Key: found.key, Type: found.typ,
 		Version: found.version, Record: found.record, Relationships: relationships,
 	}, nil
-}
-
-// HasSessionSemanticKey reports whether a Session Blackboard Key is current,
-// historical, or retained as a redirect endpoint.
-func (s *Service) HasSessionSemanticKey(ctx context.Context, sessionID, key string) (bool, error) {
-	if err := validateKey(key, "key"); err != nil {
-		return false, err
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return false, fmt.Errorf("begin Session Blackboard key lookup: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := ensureSessionExists(ctx, tx, sessionID); err != nil {
-		return false, err
-	}
-	var exists int
-	err = tx.QueryRowContext(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM blackboard_v2_session_records WHERE session_id = ? AND key = ?
-			UNION ALL
-			SELECT 1 FROM blackboard_v2_session_record_history WHERE session_id = ? AND key = ?
-			UNION ALL
-			SELECT 1 FROM blackboard_v2_session_key_redirects
-			WHERE session_id = ? AND (source_key = ? OR canonical_key = ?)
-		)`, sessionID, key, sessionID, key, sessionID, key, key,
-	).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("read Session Blackboard key existence: %w", err)
-	}
-	return exists == 1, nil
 }
 
 // ReadSessionHistory reads deterministic Session Semantic History using the
@@ -317,71 +273,6 @@ func (s *Service) SessionRuntimeSnapshotProjection(ctx context.Context, sessionI
 // callers that used the original owner-neutral projection name.
 func (s *Service) ProjectSessionRuntimeSnapshot(ctx context.Context, sessionID string) (RuntimeSnapshotProjection, error) {
 	return s.SessionRuntimeSnapshotProjection(ctx, sessionID)
-}
-
-// SynchronizeSessionContinuation advances a trusted Session Continuation's
-// Working Snapshot to the current Session Blackboard revision after a real
-// optimistic-concurrency race. It shares the owner-neutral synchronization
-// result shape with Project Continuations, but never consults Project tables or
-// materializes a Project file.
-func (s *Service) SynchronizeSessionContinuation(ctx context.Context, sessionID, continuationID string, fromRevision int) (SynchronizationAttachment, error) {
-	if fromRevision < 0 {
-		return SynchronizationAttachment{}, semanticError("semantic_validation", "synchronization revision must not be negative", "from_revision", nil)
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return SynchronizationAttachment{}, fmt.Errorf("begin Session Continuation synchronization: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if lifecycle, err := ensureSessionState(ctx, tx, sessionID); err != nil {
-		return SynchronizationAttachment{}, err
-	} else if lifecycle != "open" {
-		return SynchronizationAttachment{}, semanticError("owner_archived", "archived Session cannot synchronize a Continuation", "", nil)
-	}
-	if err := validateSessionContinuation(ctx, tx, sessionID, continuationID); err != nil {
-		return SynchronizationAttachment{}, err
-	}
-	pin, err := readSessionContinuationPinTx(ctx, tx, sessionID, continuationID)
-	if err != nil {
-		return SynchronizationAttachment{}, err
-	}
-	if pin.ContinuationID == "" {
-		return SynchronizationAttachment{}, semanticError("authority_denied", "Session Continuation has no Blackboard launch pin", "continuation_id", nil)
-	}
-	snapshot, err := s.sessionRuntimeSnapshotTx(ctx, tx, sessionID)
-	if err != nil {
-		return SynchronizationAttachment{}, err
-	}
-	if snapshot.Revision < fromRevision {
-		return SynchronizationAttachment{}, semanticError("version_conflict", "Session Blackboard revision moved backwards", "base_revision", nil)
-	}
-	if snapshot.Revision > pin.Working.Revision {
-		encoded, marshalErr := json.Marshal(snapshot)
-		if marshalErr != nil {
-			return SynchronizationAttachment{}, fmt.Errorf("encode Session Working Snapshot: %w", marshalErr)
-		}
-		digest := sessionSnapshotDigest(encoded)
-		result, updateErr := tx.ExecContext(ctx, `UPDATE blackboard_v2_session_continuation_pins
-            SET working_revision=?,working_snapshot_json=?,working_snapshot_sha256=?,updated_at=?
-            WHERE session_id=? AND continuation_id=? AND working_revision=?`,
-			snapshot.Revision, string(encoded), digest, time.Now().UTC().Format(time.RFC3339Nano), sessionID, continuationID, pin.Working.Revision)
-		if updateErr != nil {
-			return SynchronizationAttachment{}, fmt.Errorf("advance Session Working Snapshot: %w", updateErr)
-		}
-		if changed, rowsErr := result.RowsAffected(); rowsErr != nil {
-			return SynchronizationAttachment{}, rowsErr
-		} else if changed != 1 {
-			return SynchronizationAttachment{}, semanticError("version_conflict", "Session Working Snapshot changed during synchronization", "base_revision", nil)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return SynchronizationAttachment{}, fmt.Errorf("commit Session Continuation synchronization: %w", err)
-	}
-	return SynchronizationAttachment{
-		Reason: "session_blackboard_changed", FromRevision: fromRevision, Revision: snapshot.Revision, Snapshot: snapshot,
-	}, nil
 }
 
 // SessionSemanticHealth reuses the v2 health diagnosis while omitting
@@ -698,262 +589,6 @@ func (s *Service) FinishSessionContinuation(ctx context.Context, sessionID, cont
 	return result, nil
 }
 
-// RecordSessionFinishIntent records a Blackboard Finish Intent for a Session
-// owner without closing the Session Continuation (ADR 0022). Mirrors
-// RecordFinishIntent for the Project owner.
-func (s *Service) RecordSessionFinishIntent(ctx context.Context, sessionID, continuationID, idempotencyKey string, provenance FinishIntentProvenance) (FinishContinuationResult, error) {
-	if strings.TrimSpace(continuationID) == "" {
-		return FinishContinuationResult{}, semanticError("authority_denied", "trusted Continuation identity is required", "", nil)
-	}
-	if strings.TrimSpace(idempotencyKey) == "" {
-		return FinishContinuationResult{}, semanticError("semantic_validation", "idempotency_key is required", "idempotency_key", nil)
-	}
-	if strings.TrimSpace(provenance.SourceTurnID) == "" {
-		return FinishContinuationResult{}, semanticError("semantic_validation", "finish intent requires source Work Turn provenance", "source_turn_id", nil)
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FinishContinuationResult{}, fmt.Errorf("begin Session Continuation finish intent: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := ensureSessionState(ctx, tx, sessionID); err != nil {
-		return FinishContinuationResult{}, err
-	}
-	requestHash := sessionFinishRequestHash(idempotencyKey)
-	existing, found, err := readSessionFinishIntentRow(ctx, tx, continuationID)
-	if err != nil {
-		return FinishContinuationResult{}, err
-	}
-	if found && existing.Valid {
-		if existing.IdempotencyKey != idempotencyKey || existing.RequestHash != requestHash {
-			return FinishContinuationResult{}, semanticError("finish_conflict", "Continuation already recorded a Finish Intent with different semantics", "idempotency_key", nil)
-		}
-		revision, err := sessionCurrentRevision(ctx, tx, sessionID)
-		if err != nil {
-			return FinishContinuationResult{}, err
-		}
-		if err := tx.Commit(); err != nil {
-			return FinishContinuationResult{}, fmt.Errorf("commit Session Continuation finish intent replay: %w", err)
-		}
-		return finishIntentResult(revision), nil
-	}
-	if found && !existing.Valid {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM blackboard_v2_session_finish_intents WHERE continuation_id=? AND invalidated=1`, continuationID); err != nil {
-			return FinishContinuationResult{}, fmt.Errorf("replace invalidated Session Finish Intent: %w", err)
-		}
-	}
-	// A finish receipt already exists (closed). Replay the receipt for the same
-	// key/hash, otherwise report closed authority truthfully.
-	var storedKey, storedHash, raw string
-	err = tx.QueryRowContext(ctx, `
-		SELECT idempotency_key, request_hash, result_json FROM blackboard_v2_session_finish_receipts
-		WHERE session_id=? AND continuation_id=?
-		ORDER BY created_at ASC, idempotency_key ASC LIMIT 1`, sessionID, continuationID).Scan(&storedKey, &storedHash, &raw)
-	if err == nil {
-		if storedKey == idempotencyKey && storedHash == requestHash {
-			var result FinishContinuationResult
-			if err := decodeJSON([]byte(raw), &result); err != nil {
-				return FinishContinuationResult{}, fmt.Errorf("decode Session Continuation finish replay: %w", err)
-			}
-			if err := tx.Commit(); err != nil {
-				return FinishContinuationResult{}, fmt.Errorf("commit Session Continuation finish intent replay: %w", err)
-			}
-			return result, nil
-		}
-		return FinishContinuationResult{}, semanticError("closed_continuation", "trusted Continuation is closed for new Session writes", "", nil)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return FinishContinuationResult{}, fmt.Errorf("read Session Continuation finish receipt: %w", err)
-	}
-	var ownerConflict string
-	err = tx.QueryRowContext(ctx, `SELECT continuation_id FROM blackboard_v2_session_finish_intents WHERE session_id=? AND idempotency_key=?`, sessionID, idempotencyKey).Scan(&ownerConflict)
-	if err == nil && ownerConflict != continuationID {
-		return FinishContinuationResult{}, semanticError("authority_denied", "Finish intent idempotency key belongs to another trusted origin", "idempotency_key", nil)
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return FinishContinuationResult{}, fmt.Errorf("read Session Continuation Finish Intent key owner: %w", err)
-	}
-	if err := validateSessionContinuation(ctx, tx, sessionID, continuationID); err != nil {
-		return FinishContinuationResult{}, err
-	}
-	pin, err := readSessionContinuationPinTx(ctx, tx, sessionID, continuationID)
-	if err != nil {
-		return FinishContinuationResult{}, err
-	}
-	if pin.ContinuationID == "" {
-		return FinishContinuationResult{}, semanticError("authority_denied", "Session Continuation has no Blackboard launch pin", "continuation_id", nil)
-	}
-	_, _, err = sessionContinuationOwnsCurrentPath(ctx, tx, sessionID, continuationID)
-	if err != nil {
-		return FinishContinuationResult{}, err
-	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO blackboard_v2_session_finish_intents
-		(continuation_id,session_id,idempotency_key,request_hash,source_turn_id,source_work_watermark,invalidated,invalidated_at,recorded_at)
-		VALUES (?,?,?,?,?, ?,0,'',?)`,
-		continuationID, sessionID, idempotencyKey, requestHash,
-		provenance.SourceTurnID, provenance.SourceWorkWatermark, now,
-	); err != nil {
-		return FinishContinuationResult{}, fmt.Errorf("store Session Continuation Finish Intent: %w", err)
-	}
-	revision, err := sessionCurrentRevision(ctx, tx, sessionID)
-	if err != nil {
-		return FinishContinuationResult{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return FinishContinuationResult{}, fmt.Errorf("commit Session Continuation Finish Intent: %w", err)
-	}
-	return finishIntentResult(revision), nil
-}
-
-// InvalidateSessionFinishIntent marks the latest valid Session Finish Intent
-// invalidated. Safe no-op when no valid intent exists.
-func (s *Service) InvalidateSessionFinishIntent(ctx context.Context, sessionID, continuationID string) error {
-	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(continuationID) == "" {
-		return nil
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin Session Finish Intent invalidation: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := tx.ExecContext(ctx, `
-		UPDATE blackboard_v2_session_finish_intents
-		SET invalidated=1, invalidated_at=?
-		WHERE continuation_id=? AND session_id=? AND invalidated=0`, now, continuationID, sessionID)
-	if err != nil {
-		return fmt.Errorf("invalidate Session Finish Intent: %w", err)
-	}
-	if changed, err := res.RowsAffected(); err != nil {
-		return fmt.Errorf("count invalidated Session Finish Intent: %w", err)
-	} else if changed == 0 {
-		return tx.Rollback()
-	}
-	return tx.Commit()
-}
-
-// SessionFinishIntentForContinuation returns the latest recorded Session Finish
-// Intent for a Continuation. The boolean is false when no intent exists.
-func (s *Service) SessionFinishIntentForContinuation(ctx context.Context, sessionID, continuationID string) (FinishIntent, bool, error) {
-	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(continuationID) == "" {
-		return FinishIntent{}, false, nil
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return FinishIntent{}, false, fmt.Errorf("begin read Session Finish Intent: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	intent, found, err := readSessionFinishIntentRow(ctx, tx, continuationID)
-	if err != nil {
-		return FinishIntent{}, false, err
-	}
-	return intent, found, nil
-}
-
-// SettleSessionFinishIntent closes the Session Continuation's Blackboard write
-// protocol when the latest Finish Intent is still valid and the Work Turn has
-// settled. Mirrors SettleFinishIntent for the Project owner.
-func (s *Service) SettleSessionFinishIntent(ctx context.Context, sessionID, continuationID string) (bool, error) {
-	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(continuationID) == "" {
-		return false, nil
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("begin Session Finish Intent settlement: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	intent, found, err := readSessionFinishIntentRow(ctx, tx, continuationID)
-	if err != nil {
-		return false, err
-	}
-	if !found || !intent.Valid {
-		return false, nil
-	}
-	if err := validateSessionContinuation(ctx, tx, sessionID, continuationID); err != nil {
-		return false, err
-	}
-	pin, err := readSessionContinuationPinTx(ctx, tx, sessionID, continuationID)
-	if err != nil {
-		return false, err
-	}
-	if pin.ContinuationID == "" {
-		return false, nil
-	}
-	var openAttempts int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM blackboard_v2_session_records
-		WHERE session_id=? AND type='attempt' AND json_extract(record_json, '$.status')='open'`, sessionID).Scan(&openAttempts); err != nil {
-		return false, fmt.Errorf("check open Session Attempts at settlement: %w", err)
-	}
-	if openAttempts != 0 {
-		return false, semanticError("continuation_open_attempts", "Session Continuation cannot finish while an Attempt is open", "", nil)
-	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if err := s.persistSessionSnapshot(ctx, tx, sessionID, continuationID, now); err != nil {
-		return false, fmt.Errorf("synchronize Session Working Snapshot for Finish settlement: %w", err)
-	}
-	revision, err := sessionCurrentRevision(ctx, tx, sessionID)
-	if err != nil {
-		return false, err
-	}
-	result := FinishContinuationResult{
-		Schema: finishResultSchema, Status: FinishStatusFinished, Revision: revision,
-		WorkingSnapshot: WorkingSnapshot{Path: workingPath, Revision: revision},
-	}
-	resultJSON, err := json.Marshal(result)
-	if err != nil {
-		return false, fmt.Errorf("encode Session Continuation finish settlement result: %w", err)
-	}
-	updated, err := tx.ExecContext(ctx, `
-		UPDATE session_continuations SET status='completed', updated_at=?, ended_at=?
-		WHERE id=? AND session_id=? AND status IN ('pending','running')`, now, now, continuationID, sessionID)
-	if err != nil {
-		return false, fmt.Errorf("finish Session Continuation at settlement: %w", err)
-	}
-	if affected, err := updated.RowsAffected(); err != nil {
-		return false, fmt.Errorf("count Session Continuation finish at settlement: %w", err)
-	} else if affected != 1 {
-		return false, nil
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO blackboard_v2_session_finish_receipts
-		(session_id, continuation_id, idempotency_key, request_hash, result_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, sessionID, continuationID, intent.IdempotencyKey, intent.RequestHash, string(resultJSON), now); err != nil {
-		return false, fmt.Errorf("store Session Continuation finish settlement receipt: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit Session Continuation Finish Intent settlement: %w", err)
-	}
-	return true, nil
-}
-
-func readSessionFinishIntentRow(ctx context.Context, tx *sql.Tx, continuationID string) (FinishIntent, bool, error) {
-	var intent FinishIntent
-	var invalidated int
-	err := tx.QueryRowContext(ctx, `
-		SELECT continuation_id,idempotency_key,request_hash,source_turn_id,source_work_watermark,invalidated,invalidated_at,recorded_at
-		FROM blackboard_v2_session_finish_intents WHERE continuation_id=?`, continuationID,
-	).Scan(&intent.ContinuationID, &intent.IdempotencyKey, &intent.RequestHash,
-		&intent.SourceTurnID, &intent.SourceWorkWatermark, &invalidated,
-		&intent.InvalidatedAt, &intent.RecordedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FinishIntent{}, false, nil
-	}
-	if err != nil {
-		return FinishIntent{}, false, fmt.Errorf("read Session Finish Intent: %w", err)
-	}
-	intent.Valid = invalidated == 0
-	return intent, true, nil
-}
-
 // CheckpointSessionAttemptForContinuation records a compact owner-local
 // summary for a running Session Attempt using the shared semantic kernel.
 func (s *Service) CheckpointSessionAttemptForContinuation(ctx context.Context, sessionID, continuationID string, request CheckpointAttemptRequest) (ChangeResult, error) {
@@ -1053,6 +688,7 @@ func (s *Service) applySession(ctx context.Context, sessionID, continuationID st
 		})
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	baseRevision := revision
 	kernel, err := applySemanticChangeSet(ctx, tx, revision, batch.Changes, now, semanticChangeBackend{
 		prepare: func(_ context.Context, _ *sql.Tx, change Change, index int) (Change, error) {
 			return change, validateSessionChangeCapability(change, index)
@@ -1085,7 +721,11 @@ func (s *Service) applySession(ctx context.Context, sessionID, continuationID st
 		return ChangeResult{}, err
 	}
 	result := makeChangeResult(revision, kernel.ChangedRecords, kernel.ChangedRelations)
-	if err := s.persistSessionSnapshot(ctx, tx, sessionID, continuationID, now); err != nil {
+	snapshot, err := s.sessionSnapshotWithChangesTx(ctx, tx, sessionID, baseRevision, kernel)
+	if err != nil {
+		return ChangeResult{}, err
+	}
+	if err := s.persistSessionSnapshotValue(ctx, tx, sessionID, continuationID, now, snapshot); err != nil {
 		return ChangeResult{}, err
 	}
 	resultJSON, err := json.Marshal(result)
@@ -2273,92 +1913,44 @@ func sessionMoveCurrentRelationshipsToHistory(ctx context.Context, tx *sql.Tx, s
 	return nil
 }
 
+// Each reachability check runs in one statement. UNION deduplicates visited
+// keys, including when retained data already contains a cycle. The transaction
+// sees relationships added by earlier operations in the same Change Batch.
 func sessionRelationshipWouldCycle(ctx context.Context, tx *sql.Tx, sessionID, relation, fromKey, toKey string) (bool, error) {
-	if fromKey == toKey {
-		return true, nil
+	var cycle int
+	err := tx.QueryRowContext(ctx, `WITH RECURSIVE reachable(key) AS (
+  SELECT ?
+  UNION
+  SELECT rel.to_key FROM blackboard_v2_session_relationships rel
+  JOIN reachable ON rel.from_key=reachable.key
+  WHERE rel.session_id=? AND rel.relation=?
+ ) SELECT EXISTS(SELECT 1 FROM reachable WHERE key=?)`, toKey, sessionID, relation, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read Session %s relationships: %w", relation, err)
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT to_key FROM blackboard_v2_session_relationships
-			WHERE session_id=? AND from_key=? AND relation=? ORDER BY to_key ASC`, sessionID, key, relation)
-		if err != nil {
-			return false, fmt.Errorf("read Session %s relationships: %w", relation, err)
-		}
-		for rows.Next() {
-			var target string
-			if err := rows.Scan(&target); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan Session %s relationships: %w", relation, err)
-			}
-			stack = append(stack, target)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate Session %s relationships: %w", relation, err)
-		}
-		if err := rows.Close(); err != nil {
-			return false, fmt.Errorf("close Session %s relationships: %w", relation, err)
-		}
-	}
-	return false, nil
+	return cycle != 0, nil
 }
 
 func sessionFactSupportsWouldCycle(ctx context.Context, tx *sql.Tx, sessionID, fromKey, toKey string) (bool, error) {
 	if fromKey == toKey {
 		return true, nil
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT rel.to_key
-			FROM blackboard_v2_session_relationships AS rel
-			JOIN blackboard_v2_session_records AS source
-			  ON source.session_id=rel.session_id AND source.key=rel.from_key AND source.type='fact'
-			JOIN blackboard_v2_session_records AS target
-			  ON target.session_id=rel.session_id AND target.key=rel.to_key AND target.type='fact'
-			WHERE rel.session_id=? AND rel.from_key=? AND rel.relation='supports'
-			ORDER BY rel.to_key ASC`, sessionID, key)
-		if err != nil {
-			return false, fmt.Errorf("read Session Fact supports relationships: %w", err)
-		}
-		for rows.Next() {
-			var target string
-			if err := rows.Scan(&target); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan Session Fact supports relationship: %w", err)
-			}
-			stack = append(stack, target)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate Session Fact supports relationships: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return false, fmt.Errorf("close Session Fact supports relationships: %w", err)
-		}
+	var cycle int
+	err := tx.QueryRowContext(ctx, `WITH RECURSIVE reachable(key) AS (
+  SELECT ?
+  UNION
+  SELECT rel.to_key FROM blackboard_v2_session_relationships rel
+  JOIN reachable ON rel.from_key=reachable.key
+  JOIN blackboard_v2_session_records source
+   ON source.session_id=rel.session_id AND source.key=rel.from_key AND source.type='fact'
+  JOIN blackboard_v2_session_records target
+   ON target.session_id=rel.session_id AND target.key=rel.to_key AND target.type='fact'
+  WHERE rel.session_id=? AND rel.relation='supports'
+ ) SELECT EXISTS(SELECT 1 FROM reachable WHERE key=?)`, toKey, sessionID, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read Session Fact supports relationships: %w", err)
 	}
-	return false, nil
+	return cycle != 0, nil
 }
 
 func sessionHasIncomingSatisfies(ctx context.Context, tx *sql.Tx, sessionID, objectiveKey string) (bool, error) {
@@ -2439,6 +2031,10 @@ func (s *Service) persistSessionSnapshot(ctx context.Context, tx *sql.Tx, sessio
 	if err != nil {
 		return err
 	}
+	return s.persistSessionSnapshotValue(ctx, tx, sessionID, continuationID, now, snapshot)
+}
+
+func (s *Service) persistSessionSnapshotValue(ctx context.Context, tx *sql.Tx, sessionID, continuationID, now string, snapshot RuntimeSnapshot) error {
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("encode Session Working Snapshot: %w", err)

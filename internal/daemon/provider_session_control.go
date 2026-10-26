@@ -118,7 +118,6 @@ func (server *Server) BindProviderSession(taskID string, session runtime.Provide
 	if err := server.providerSessions.bind(taskID, session); err != nil {
 		return err
 	}
-	server.clearRecoveredRuntimeActivity(taskID)
 	if sink, ok := session.(runtime.ProviderSessionEventSink); ok {
 		sink.SetEventSink(func(kind task.EventKind, payload task.EventPayload) {
 			server.persistProviderSessionEvent(taskID, kind, payload)
@@ -148,11 +147,8 @@ func (server *Server) BindSessionProviderSession(sessionID string, providerSessi
 }
 
 func (server *Server) persistSessionProviderSessionEvent(sessionID string, kind task.EventKind, payload task.EventPayload) {
-	if continuation, err := server.sessions.ActiveContinuation(sessionID); err == nil && continuation != nil {
-		server.persistSessionProviderEventForContinuation(sessionID, continuation.ID, kind, payload)
-		return
-	}
-	server.persistSessionProviderEventForContinuation(sessionID, "", kind, payload)
+	mappedKind, filtered := sessionProviderEventPayload(kind, payload, "")
+	_, _ = server.sessions.AppendProviderEvent(sessionID, mappedKind, filtered)
 }
 
 // sessionProviderEventPayload copies the fixed correlation allowlist into the
@@ -228,15 +224,7 @@ func (server *Server) persistProviderSessionEvent(taskID string, kind task.Event
 	if filtered["mode"] == string(runtime.ProviderSessionModePermissionResponse) && filtered["outcome"] == "requested" {
 		filtered["phase"] = "provider_permission_requested"
 	}
-	continuation, err := server.tasks.ActiveContinuation(taskID)
-	if err != nil {
-		return
-	}
-	if continuation != nil {
-		_, _ = server.tasks.AppendContinuationEvent(taskID, continuation.ID, kind, filtered)
-		return
-	}
-	_, _ = server.tasks.AppendEvent(taskID, kind, filtered)
+	_, _ = server.tasks.AppendProviderEvent(taskID, kind, filtered)
 }
 
 func (server *Server) closeProviderSession(taskID string) error {
