@@ -1555,8 +1555,8 @@ func (server *Server) decorateTask(found task.Task) (task.Task, error) {
 	if err != nil {
 		return task.Task{}, err
 	}
-	if versions, versionErr := server.tasks.RuntimeConfigVersions(found.ID); versionErr == nil && len(versions) > 0 {
-		if snapshot, snapshotErr := decodeRuntimeSnapshot(versions[len(versions)-1].Config); snapshotErr == nil {
+	if version, versionErr := server.tasks.LatestRuntimeConfig(found.ID); versionErr == nil && version != nil {
+		if snapshot, snapshotErr := decodeRuntimeSnapshot(version.Config); snapshotErr == nil {
 			summary := runtimeconfig.Summarize(snapshot)
 			found.RuntimeConfiguration = &summary
 		}
@@ -1625,7 +1625,7 @@ func (server *Server) runtimeControlsForTask(found task.Task, latest *task.TaskC
 			ReasoningEffort: selection.RequestedReasoningEffort,
 		}
 	}
-	if events, eventsErr := server.tasks.Events(found.ID); eventsErr == nil {
+	if events, eventsErr := server.tasks.RuntimeControlEvents(found.ID); eventsErr == nil {
 		if providerSessionBound {
 			controls.ProviderPermissions = providerPermissionRequestsForTask(events)
 		}
