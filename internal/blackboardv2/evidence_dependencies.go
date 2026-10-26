@@ -114,7 +114,7 @@ func (s *Service) validateDependentConfirmedFactBases(ctx context.Context, tx *s
 
 func (s *Service) factHasDurableBasis(ctx context.Context, tx *sql.Tx, projectID, factKey string) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT evidence.record_json
+		SELECT evidence.key, evidence.version, evidence.record_json
 		FROM blackboard_v2_relationships AS rel
 		JOIN blackboard_v2_records AS evidence
 		  ON evidence.project_id=rel.project_id AND evidence.key=rel.from_key AND evidence.type='evidence'
@@ -124,8 +124,9 @@ func (s *Service) factHasDurableBasis(ctx context.Context, tx *sql.Tx, projectID
 		return false, fmt.Errorf("read durable Evidence bases: %w", err)
 	}
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var key, raw string
+		var version int
+		if err := rows.Scan(&key, &version, &raw); err != nil {
 			rows.Close()
 			return false, fmt.Errorf("scan durable Evidence basis: %w", err)
 		}
@@ -134,7 +135,7 @@ func (s *Service) factHasDurableBasis(ctx context.Context, tx *sql.Tx, projectID
 			rows.Close()
 			return false, fmt.Errorf("decode durable Evidence basis: %w", err)
 		}
-		valid, err := s.evidenceIntegrityValid(projectID, evidence)
+		valid, err := s.applyEvidenceIntegrityValid(ctx, projectID, key, version, evidence)
 		if err != nil {
 			rows.Close()
 			return false, err
