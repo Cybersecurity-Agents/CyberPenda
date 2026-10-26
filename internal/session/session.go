@@ -868,6 +868,29 @@ func (s *Service) Events(id string) ([]Event, error) {
 	return scanEvents(rows)
 }
 
+// EventsByKind reads only the Session Events needed by one projection.
+// An empty kind list returns no Events; it never expands into a full history read.
+func (s *Service) EventsByKind(id string, kinds ...EventKind) ([]Event, error) {
+	if _, err := s.Get(id); err != nil {
+		return nil, err
+	}
+	if len(kinds) == 0 {
+		return []Event{}, nil
+	}
+	placeholders := make([]string, len(kinds))
+	args := []any{id}
+	for i, kind := range kinds {
+		placeholders[i] = "?"
+		args = append(args, kind)
+	}
+	rows, err := s.db.Query(`SELECT id,session_id,seq,kind,payload_json,created_at FROM session_events WHERE session_id=? AND kind IN (`+strings.Join(placeholders, ",")+`) ORDER BY seq ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list Session Events by kind: %w", err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
 // EventProjection selects the Session Event kinds needed by one Runtime Owner
 // history projection.
 type EventProjection string
@@ -1309,17 +1332,7 @@ func payloadWithContinuation(payload EventPayload, continuationID string) EventP
 
 // Conversation returns only user/runtime conversation entries.
 func (s *Service) Conversation(id string) ([]Event, error) {
-	events, err := s.Events(id)
-	if err != nil {
-		return nil, err
-	}
-	conversation := make([]Event, 0, len(events))
-	for _, event := range events {
-		if event.Kind == EventKindConversation {
-			conversation = append(conversation, event)
-		}
-	}
-	return conversation, nil
+	return s.EventsByKind(id, EventKindConversation)
 }
 
 // RecordRuntimeConfig stores the non-secret Runtime Turn Selection history for

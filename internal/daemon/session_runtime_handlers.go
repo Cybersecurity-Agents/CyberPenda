@@ -114,7 +114,7 @@ func sessionGoalWithAttachmentEvents(goal, workdir string, run session.Runner, e
 }
 
 func (server *Server) sessionLaunchGoal(found session.Session, goal string, run session.Runner) (string, error) {
-	events, err := server.sessions.Events(found.ID)
+	events, err := server.sessions.EventsByKind(found.ID, session.EventKindAttachment)
 	if err != nil {
 		return "", err
 	}
