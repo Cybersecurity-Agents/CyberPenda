@@ -5,47 +5,74 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 
 	"pentest/internal/project"
 	"pentest/internal/store"
 )
 
-// Keep the affected-key filter indexable as Projects gain unrelated Findings
-// and Solutions. Avoid replacing it with a Go filter after a Project scan.
-func TestConclusionValidationAffectedKeysUsePrimaryKeyProbes(t *testing.T) {
-	db, err := store.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+// Exercise the real validators, not a copied SQL statement. Both an accidental
+// full-table decode and a validator that skips affected rows must fail here.
+func TestSelectedConclusionValidationIsolatesLargeUnrelatedCorpus(t *testing.T) {
 	for _, typ := range []string{"finding", "solution"} {
-		rows, err := db.Query(`EXPLAIN QUERY PLAN SELECT key,record_json FROM blackboard_v2_records
-   WHERE project_id=? AND type=? AND key IN (SELECT value FROM json_each(?)) ORDER BY key`, "project", typ, `["selected"]`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		indexed := false
-		details := []string{}
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-				rows.Close()
+		t.Run(typ, func(t *testing.T) {
+			db, err := store.Open("")
+			if err != nil {
 				t.Fatal(err)
 			}
-			details = append(details, detail)
-			indexed = indexed || strings.Contains(detail, "project_id=? AND key=?")
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			t.Fatal(err)
-		}
-		rows.Close()
-		if !indexed {
-			t.Fatalf("%s validation does not probe selected primary keys: %v", typ, details)
-		}
+			defer db.Close()
+			kind := project.KindPentest
+			var record any = findingOutputRecord{Status: "unconfirmed", Title: "Selected Finding", CVSSPending: true}
+			validate := validateConfirmedFindings
+			if typ == "solution" {
+				kind = project.KindCTFChallenge
+				record = SolutionRecord{Status: "candidate", Kind: "flag", Summary: "Selected Solution", Value: "flag"}
+				validate = validateVerifiedSolutions
+			}
+			proj, err := project.NewService(db).CreateWithKind("Selected validation", "", kind, project.Scope{}, project.Defaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			insert := func(key, raw string) {
+				t.Helper()
+				if _, err := tx.Exec(`INSERT INTO blackboard_v2_records(project_id,key,type,version,record_json,created_at,updated_at) VALUES(?,?,?,1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, proj.ID, key, typ, raw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := 0; i < 1000; i++ {
+				insert(fmt.Sprintf("%s:unrelated-%04d", typ, i), "invalid unrelated JSON")
+			}
+			selected := []string{typ + ":selected-a", typ + ":selected-b"}
+			for _, key := range selected {
+				insert(key, string(encoded))
+			}
+			if err := validate(context.Background(), tx, proj.ID, selected); err != nil {
+				t.Fatalf("selected validation decoded an unrelated row: %v", err)
+			}
+			if err := validate(context.Background(), tx, proj.ID, nil); err == nil {
+				t.Fatal("full validation skipped unrelated corrupt rows")
+			}
+			for _, key := range selected {
+				if _, err := tx.Exec(`UPDATE blackboard_v2_records SET record_json='invalid selected JSON' WHERE project_id=? AND key=?`, proj.ID, key); err != nil {
+					t.Fatal(err)
+				}
+				if err := validate(context.Background(), tx, proj.ID, selected); err == nil {
+					t.Fatalf("selected corrupt row %s escaped validation", key)
+				}
+				if _, err := tx.Exec(`UPDATE blackboard_v2_records SET record_json=? WHERE project_id=? AND key=?`, string(encoded), proj.ID, key); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
