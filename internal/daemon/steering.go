@@ -221,6 +221,12 @@ const defaultAcceptedSteeringDispatchTimeout = 30 * time.Second
 // record is committed before this returns, so a 202 Accepted is returned only
 // after the request and its settlement responsibility are durable.
 func (server *Server) acceptSteeringDurably(ctx context.Context, adapter *steeringAdapter, input steering.AcceptRequest, project func(tx *sql.Tx) (string, error)) (*owner.SteeringRecord, error) {
+	if adapter.kind == owner.KindSession {
+		if err := server.sessions.FlushRuntimeOutputs(adapter.id); err != nil {
+			return nil, err
+		}
+	}
+
 	record, err := server.steering.Accept(ctx, adapter.kind, adapter.id, input, project)
 	if err != nil {
 		return nil, err

@@ -9,6 +9,9 @@ import (
 // AppendProviderEvent resolves the active Runtime Continuation and appends the
 // Event in one transaction. Provider payloads cannot select another binding.
 func (s *Service) AppendProviderEvent(sessionID string, kind EventKind, payload EventPayload) (Event, error) {
+	if err := s.FlushRuntimeOutputs(sessionID); err != nil {
+		return Event{}, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Event{}, fmt.Errorf("begin Session provider event: %w", err)
