@@ -43,3 +43,30 @@ func (s *Service) LatestRuntimeConfig(taskID string) (*RuntimeConfigVersion, err
 	}
 	return &version, nil
 }
+
+// LatestTurnSelectionEvent reads the newest Conversation or Steering event with
+// a usable turn selection. The whitespace set is Go unicode.White_Space, as used
+// by strings.TrimSpace in the turn projection.
+func (s *Service) LatestTurnSelectionEvent(taskID string) (*Event, error) {
+	const whitespace = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+	rows, err := s.db.Query(`WITH candidates AS (
+ SELECT *,
+ CASE WHEN json_type(payload_json,'$.model_provider_id')='text' THEN json_extract(payload_json,'$.model_provider_id') ELSE '' END AS provider,
+ COALESCE(NULLIF(CASE WHEN json_type(payload_json,'$.model')='text' THEN json_extract(payload_json,'$.model') ELSE '' END,''), CASE WHEN json_type(payload_json,'$.model_override')='text' THEN json_extract(payload_json,'$.model_override') ELSE '' END) AS model,
+ COALESCE(NULLIF(CASE WHEN json_type(payload_json,'$.requested_reasoning_effort')='text' THEN json_extract(payload_json,'$.requested_reasoning_effort') ELSE '' END,''), CASE WHEN json_type(payload_json,'$.reasoning_effort')='text' THEN json_extract(payload_json,'$.reasoning_effort') ELSE '' END) AS effort
+ FROM task_events WHERE task_id=? AND kind IN ('conversation','steering'))
+ SELECT id,task_id,continuation_id,attempt_node_id,seq,kind,payload_json,created_at FROM candidates
+ WHERE trim(provider,?)!='' OR trim(model,?)!='' OR (kind='conversation' AND trim(effort,?)!='') ORDER BY seq DESC LIMIT 1`, taskID, whitespace, whitespace, whitespace)
+	if err != nil {
+		return nil, fmt.Errorf("read latest Runtime Turn Selection: %w", err)
+	}
+	defer rows.Close()
+	events, err := scanEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, nil
+	}
+	return &events[0], nil
+}

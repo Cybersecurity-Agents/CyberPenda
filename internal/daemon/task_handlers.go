@@ -3569,11 +3569,11 @@ func (server *Server) piProjectedProviderAllowed(found task.Task, providerID str
 }
 
 func (server *Server) projectedPiModelProviderIDs(found task.Task) []string {
-	versions, err := server.tasks.RuntimeConfigVersions(found.ID)
-	if err != nil || len(versions) == 0 {
+	latestVersion, err := server.tasks.LatestRuntimeConfig(found.ID)
+	if err != nil || latestVersion == nil {
 		return nil
 	}
-	snapshot, err := decodeRuntimeSnapshot(versions[len(versions)-1].Config)
+	snapshot, err := decodeRuntimeSnapshot(latestVersion.Config)
 	if err != nil {
 		return nil
 	}
@@ -3634,14 +3634,13 @@ func (server *Server) selectionFromCapturedRuntimeConfig(found task.Task) (runti
 }
 
 func (server *Server) selectionFromCapturedRuntimeConfigTimed(found task.Task) (runtime.ProviderSessionRequest, time.Time, error) {
-	versions, err := server.tasks.RuntimeConfigVersions(found.ID)
+	latestVersion, err := server.tasks.LatestRuntimeConfig(found.ID)
 	if err != nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, err
 	}
-	if len(versions) == 0 {
+	if latestVersion == nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, errors.New("runtime configuration snapshot is missing")
 	}
-	latestVersion := versions[len(versions)-1]
 	snapshot, err := decodeRuntimeSnapshot(latestVersion.Config)
 	if err != nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, err
@@ -3658,12 +3657,11 @@ func (server *Server) selectionFromCapturedRuntimeConfigTimed(found task.Task) (
 }
 
 func (server *Server) precedingConversationTurnSelectionTimed(taskID string) (runtime.ProviderSessionRequest, time.Time, bool) {
-	events, err := server.tasks.Events(taskID)
-	if err != nil {
+	latest, err := server.tasks.LatestTurnSelectionEvent(taskID)
+	if err != nil || latest == nil {
 		return runtime.ProviderSessionRequest{}, time.Time{}, false
 	}
-	for index := len(events) - 1; index >= 0; index-- {
-		event := events[index]
+	for _, event := range []task.Event{*latest} {
 		// Selection is only read from existing conversation / steering turn
 		// records — never from a separate selection Task Event.
 		if event.Kind != task.EventKindConversation && event.Kind != task.EventKindSteering {
@@ -3784,14 +3782,14 @@ func (server *Server) resolveSelectedRuntimeProfile(response http.ResponseWriter
 }
 
 func (server *Server) resolveTaskRuntimeProfile(found task.Task) (runtimeprofile.Profile, error) {
-	versions, err := server.tasks.RuntimeConfigVersions(found.ID)
+	latestVersion, err := server.tasks.LatestRuntimeConfig(found.ID)
 	if err != nil {
 		return runtimeprofile.Profile{}, err
 	}
-	if len(versions) == 0 {
+	if latestVersion == nil {
 		return runtimeprofile.Profile{}, errors.New("runtime configuration snapshot is missing")
 	}
-	return runtimeProfileFromSnapshot(versions[len(versions)-1].Config)
+	return runtimeProfileFromSnapshot(latestVersion.Config)
 }
 
 func (server *Server) discoverNativeResumeSession(found task.Task) (runtime.NativeSessionMetadata, error) {
