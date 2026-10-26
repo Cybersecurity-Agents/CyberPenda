@@ -2769,92 +2769,46 @@ func relationshipWouldCycle(ctx context.Context, tx *sql.Tx, projectID, relation
 	if fromKey == toKey {
 		return true, nil
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT to_key
-			FROM blackboard_v2_relationships
-			WHERE project_id = ? AND from_key = ? AND relation = ?
-			ORDER BY to_key ASC`,
-			projectID, key, relation,
-		)
-		if err != nil {
-			return false, fmt.Errorf("read %s relationships: %w", relation, err)
-		}
-		for rows.Next() {
-			var parent string
-			if err := rows.Scan(&parent); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan %s relationships: %w", relation, err)
-			}
-			stack = append(stack, parent)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate %s relationships: %w", relation, err)
-		}
-		rows.Close()
+	// UNION (not UNION ALL) visits each key once, even if retained data has a cycle.
+	// Read through the caller's transaction so earlier changes in this batch count.
+	var cycle bool
+	err := tx.QueryRowContext(ctx, `
+  WITH RECURSIVE reachable(key) AS (
+   SELECT ?
+   UNION
+   SELECT rel.to_key FROM reachable
+   CROSS JOIN blackboard_v2_relationships AS rel
+   WHERE rel.from_key = reachable.key AND rel.project_id = ? AND rel.relation = ?
+  )
+  SELECT EXISTS(SELECT 1 FROM reachable WHERE key = ?)`, toKey, projectID, relation, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read %s relationship reachability: %w", relation, err)
 	}
-	return false, nil
+	return cycle, nil
 }
 
 func factSupportsWouldCycle(ctx context.Context, tx *sql.Tx, projectID, fromKey, toKey string) (bool, error) {
 	if fromKey == toKey {
 		return true, nil
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT rel.to_key
-			FROM blackboard_v2_relationships AS rel
-			JOIN blackboard_v2_records AS source
-			  ON source.project_id = rel.project_id AND source.key = rel.from_key AND source.type = 'fact'
-			JOIN blackboard_v2_records AS target
-			  ON target.project_id = rel.project_id AND target.key = rel.to_key AND target.type = 'fact'
-			WHERE rel.project_id = ? AND rel.from_key = ? AND rel.relation = 'supports'
-			ORDER BY rel.to_key ASC`,
-			projectID, key,
-		)
-		if err != nil {
-			return false, fmt.Errorf("read Fact supports relationships: %w", err)
-		}
-		for rows.Next() {
-			var target string
-			if err := rows.Scan(&target); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan Fact supports relationship: %w", err)
-			}
-			stack = append(stack, target)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate Fact supports relationships: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return false, fmt.Errorf("close Fact supports relationships: %w", err)
-		}
+	var cycle bool
+	err := tx.QueryRowContext(ctx, `
+  WITH RECURSIVE reachable(key) AS (
+   SELECT ?
+   UNION
+   SELECT rel.to_key FROM reachable
+   CROSS JOIN blackboard_v2_relationships AS rel
+   JOIN blackboard_v2_records AS source
+    ON source.project_id = rel.project_id AND source.key = rel.from_key AND source.type = 'fact'
+   JOIN blackboard_v2_records AS target
+    ON target.project_id = rel.project_id AND target.key = rel.to_key AND target.type = 'fact'
+   WHERE rel.from_key = reachable.key AND rel.project_id = ? AND rel.relation = 'supports'
+  )
+  SELECT EXISTS(SELECT 1 FROM reachable WHERE key = ?)`, toKey, projectID, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read Fact supports reachability: %w", err)
 	}
-	return false, nil
+	return cycle, nil
 }
 
 func moveCurrentRelationshipsToHistory(ctx context.Context, tx *sql.Tx, projectID, key, recordedAt string) error {
