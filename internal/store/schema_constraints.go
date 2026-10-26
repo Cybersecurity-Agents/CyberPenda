@@ -2,8 +2,6 @@ package store
 
 // baselineConstraintStatements holds part of the baseline schema.
 var baselineConstraintStatements = []string{
-	`CREATE INDEX idx_session_events_permissions
- ON session_events(session_id, seq ASC) WHERE kind IN ('permission','lifecycle')`,
 	`CREATE INDEX idx_blackboard_continuation_grants_continuation
 	ON blackboard_continuation_grants (continuation_id)`,
 	`CREATE INDEX idx_blackboard_v2_attempt_origins_continuation
