@@ -113,6 +113,21 @@ func (s *Service) validateDependentConfirmedFactBases(ctx context.Context, tx *s
 }
 
 func (s *Service) factHasDurableBasis(ctx context.Context, tx *sql.Tx, projectID, factKey string) (bool, error) {
+	// Any confirmed supporting Fact is already a valid semantic basis. Check
+	// it before reading potentially large Evidence payloads under the writer lock.
+	var confirmedSupport int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM blackboard_v2_relationships AS rel
+		JOIN blackboard_v2_records AS support
+		  ON support.project_id=rel.project_id AND support.key=rel.from_key AND support.type='fact'
+		WHERE rel.project_id=? AND rel.relation='supports' AND rel.to_key=?
+		  AND json_extract(support.record_json,'$.confidence')='confirmed'`, projectID, factKey).Scan(&confirmedSupport); err != nil {
+		return false, fmt.Errorf("read durable confirmed Fact bases: %w", err)
+	}
+	if confirmedSupport != 0 {
+		return true, nil
+	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT evidence.record_json
 		FROM blackboard_v2_relationships AS rel
@@ -150,19 +165,6 @@ func (s *Service) factHasDurableBasis(ctx context.Context, tx *sql.Tx, projectID
 	}
 	if err := rows.Close(); err != nil {
 		return false, fmt.Errorf("close durable Evidence bases: %w", err)
-	}
-	var confirmedSupport int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM blackboard_v2_relationships AS rel
-		JOIN blackboard_v2_records AS support
-		  ON support.project_id=rel.project_id AND support.key=rel.from_key AND support.type='fact'
-		WHERE rel.project_id=? AND rel.relation='supports' AND rel.to_key=?
-		  AND json_extract(support.record_json,'$.confidence')='confirmed'`, projectID, factKey).Scan(&confirmedSupport); err != nil {
-		return false, fmt.Errorf("read durable confirmed Fact bases: %w", err)
-	}
-	if confirmedSupport != 0 {
-		return true, nil
 	}
 	rows, err = tx.QueryContext(ctx, `
 		SELECT attempt.record_json
