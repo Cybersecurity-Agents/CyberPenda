@@ -199,7 +199,24 @@ func applySolutionTransition(ctx context.Context, tx *sql.Tx, projectID string, 
 }
 
 func validateAllVerifiedSolutions(ctx context.Context, tx *sql.Tx, projectID string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT key, record_json FROM blackboard_v2_records WHERE project_id = ? AND type = 'solution' ORDER BY key`, projectID)
+	return validateVerifiedSolutions(ctx, tx, projectID, nil)
+}
+
+func validateVerifiedSolutions(ctx context.Context, tx *sql.Tx, projectID string, keys []string) error {
+	if keys != nil && len(keys) == 0 {
+		return nil
+	}
+	query := `SELECT key,record_json FROM blackboard_v2_records WHERE project_id=? AND type='solution'`
+	args := []any{projectID}
+	if keys != nil {
+		raw, err := json.Marshal(keys)
+		if err != nil {
+			return err
+		}
+		query += ` AND key IN (SELECT value FROM json_each(?))`
+		args = append(args, string(raw))
+	}
+	rows, err := tx.QueryContext(ctx, query+` ORDER BY key`, args...)
 	if err != nil {
 		return fmt.Errorf("read current Solutions for final validation: %w", err)
 	}

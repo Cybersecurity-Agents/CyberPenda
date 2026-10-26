@@ -3,6 +3,7 @@ package blackboardv2
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -248,11 +249,24 @@ func scoreFindingCVSS(version, vector string) (string, bool, error) {
 }
 
 func validateAllConfirmedFindings(ctx context.Context, tx *sql.Tx, projectID string) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT key, record_json
-		FROM blackboard_v2_records
-		WHERE project_id = ? AND type = 'finding'
-		ORDER BY key ASC`, projectID)
+	return validateConfirmedFindings(ctx, tx, projectID, nil)
+}
+
+func validateConfirmedFindings(ctx context.Context, tx *sql.Tx, projectID string, keys []string) error {
+	if keys != nil && len(keys) == 0 {
+		return nil
+	}
+	query := `SELECT key,record_json FROM blackboard_v2_records WHERE project_id=? AND type='finding'`
+	args := []any{projectID}
+	if keys != nil {
+		raw, err := json.Marshal(keys)
+		if err != nil {
+			return err
+		}
+		query += ` AND key IN (SELECT value FROM json_each(?))`
+		args = append(args, string(raw))
+	}
+	rows, err := tx.QueryContext(ctx, query+` ORDER BY key ASC`, args...)
 	if err != nil {
 		return fmt.Errorf("read current Findings for final validation: %w", err)
 	}

@@ -938,11 +938,17 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	runtimeConfirmedFacts := make(map[string]string)
 	runtimeCreatedAttempts := make(map[string]string)
 	dependentConfirmedFacts := make(map[string]string)
+	affectedConclusions := make(map[string]bool)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	kernel, err := applySemanticChangeSet(ctx, tx, revision, batch.Changes, now, semanticChangeBackend{
 		prepare: func(ctx context.Context, tx *sql.Tx, change Change, index int) (Change, error) {
 			change, err := resolveChangeRedirects(ctx, tx, projectID, change)
 			if err != nil {
+				return Change{}, err
+			}
+			// Capture dependents before destructive changes remove their support
+			// edges (supersede/merge/unrelate), and include each explicit target.
+			if err := collectAffectedConclusions(ctx, tx, projectID, []string{change.Key, change.From, change.To, change.Source, change.Canonical, change.Replaced, change.Replacement}, affectedConclusions); err != nil {
 				return Change{}, err
 			}
 			if change.Op == "transition" && isOneOf(change.Status, "verified", "rejected") {
@@ -1109,10 +1115,25 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	if err := s.validateDependentConfirmedFactBases(ctx, tx, projectID, dependentConfirmedFacts); err != nil {
 		return ChangeResult{}, err
 	}
-	if err := validateAllConfirmedFindings(ctx, tx, projectID); err != nil {
+	changedKeys := make([]string, 0, len(kernel.ChangedRecords)+2*len(kernel.ChangedRelations))
+	for key := range kernel.ChangedRecords {
+		changedKeys = append(changedKeys, key)
+	}
+	for _, tuple := range kernel.ChangedRelations {
+		changedKeys = append(changedKeys, fmt.Sprint(tuple[0]), fmt.Sprint(tuple[2]))
+	}
+	if err := collectAffectedConclusions(ctx, tx, projectID, changedKeys, affectedConclusions); err != nil {
 		return ChangeResult{}, err
 	}
-	if err := validateAllVerifiedSolutions(ctx, tx, projectID); err != nil {
+	conclusionKeys := make([]string, 0, len(affectedConclusions))
+	for key := range affectedConclusions {
+		conclusionKeys = append(conclusionKeys, key)
+	}
+	sort.Strings(conclusionKeys)
+	if err := validateConfirmedFindings(ctx, tx, projectID, conclusionKeys); err != nil {
+		return ChangeResult{}, err
+	}
+	if err := validateVerifiedSolutions(ctx, tx, projectID, conclusionKeys); err != nil {
 		return ChangeResult{}, err
 	}
 
