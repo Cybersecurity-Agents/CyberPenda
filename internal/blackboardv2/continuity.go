@@ -1071,6 +1071,15 @@ func (s *Service) advanceContinuationWorkingSnapshotTx(ctx context.Context, tx *
 	if err != nil {
 		return nil, "", false, fmt.Errorf("read owning Working Blackboard Snapshot: %w", err)
 	}
+	revision, err := currentRevision(ctx, tx, projectID)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if revision == previousRevision {
+		// The stored Working Snapshot already represents this revision. Keep
+		// its exact bytes and avoid a redundant publication after commit.
+		return nil, "", false, nil
+	}
 	projection, err := s.ProjectRuntimeSnapshotTx(ctx, tx, projectID)
 	if err != nil {
 		return nil, "", false, err
