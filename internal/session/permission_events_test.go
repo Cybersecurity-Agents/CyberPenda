@@ -19,14 +19,18 @@ func TestPermissionEventsSelectsOnlyPermissionChangesInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, payload := range []EventPayload{
+	for i, payload := range []EventPayload{
 		{"phase": "provider_permission_requested", "permission_request_id": "p1"},
 		{"phase": "runtime_started"},
 		{"phase": "provider_permission_requested", "permission_request_id": "p2"},
 		{"phase": "provider_permission_response_applied", "permission_request_id": "p1"},
 		{"phase": "provider_permission_response_failed", "permission_request_id": "p2"},
 	} {
-		if _, err := s.AppendEvent(created.ID, EventKindLifecycle, payload); err != nil {
+		kind := EventKindLifecycle
+		if i == 0 {
+			kind = EventKindPermission
+		}
+		if _, err := s.AppendEvent(created.ID, kind, payload); err != nil {
 			t.Fatal(err)
 		}
 	}
