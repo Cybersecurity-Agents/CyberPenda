@@ -857,12 +857,6 @@ func markContinuationReconciled(ctx context.Context, tx *sql.Tx, continuationID,
 }
 
 func (s *Service) apply(ctx context.Context, projectID, continuationID string, batch ChangeBatch, expectedBaseRevision *int) (ChangeResult, error) {
-	if err := validateChangeBatchDTOShape(batch); err != nil {
-		return ChangeResult{}, err
-	}
-	// Hash relevant retained bytes before taking the global writer lock or
-	// opening the write transaction. Results belong to this Apply only.
-	ctx = s.preflightApplyEvidence(ctx, projectID, batch)
 	s.writeMu.Lock()
 	writeLocked := true
 	defer func() {
@@ -2386,7 +2380,7 @@ func (s *Service) runtimeFactConfirmationHasBasis(ctx context.Context, tx *sql.T
 	}
 
 	rows, err = tx.QueryContext(ctx, `
-		SELECT source.key, source.version, source.record_json
+		SELECT source.record_json
 		FROM blackboard_v2_relationships AS rel
 		JOIN blackboard_v2_records AS source
 		  ON source.project_id = rel.project_id AND source.key = rel.from_key
@@ -2398,9 +2392,8 @@ func (s *Service) runtimeFactConfirmationHasBasis(ctx context.Context, tx *sql.T
 		return false, fmt.Errorf("read Evidence for confirmation: %w", err)
 	}
 	for rows.Next() {
-		var key, raw string
-		var version int
-		if err := rows.Scan(&key, &version, &raw); err != nil {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
 			rows.Close()
 			return false, fmt.Errorf("scan Evidence for confirmation: %w", err)
 		}
@@ -2410,7 +2403,7 @@ func (s *Service) runtimeFactConfirmationHasBasis(ctx context.Context, tx *sql.T
 			return false, fmt.Errorf("decode Evidence for confirmation: %w", err)
 		}
 		if source.Status == "available" {
-			valid, err := s.applyEvidenceIntegrityValid(ctx, projectID, key, version, source)
+			valid, err := s.evidenceIntegrityValid(projectID, source)
 			if err != nil {
 				rows.Close()
 				return false, err
