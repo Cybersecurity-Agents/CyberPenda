@@ -1908,92 +1908,44 @@ func sessionMoveCurrentRelationshipsToHistory(ctx context.Context, tx *sql.Tx, s
 	return nil
 }
 
+// Each reachability check runs in one statement. UNION deduplicates visited
+// keys, including when retained data already contains a cycle. The transaction
+// sees relationships added by earlier operations in the same Change Batch.
 func sessionRelationshipWouldCycle(ctx context.Context, tx *sql.Tx, sessionID, relation, fromKey, toKey string) (bool, error) {
-	if fromKey == toKey {
-		return true, nil
+	var cycle int
+	err := tx.QueryRowContext(ctx, `WITH RECURSIVE reachable(key) AS (
+  SELECT ?
+  UNION
+  SELECT rel.to_key FROM blackboard_v2_session_relationships rel
+  JOIN reachable ON rel.from_key=reachable.key
+  WHERE rel.session_id=? AND rel.relation=?
+ ) SELECT EXISTS(SELECT 1 FROM reachable WHERE key=?)`, toKey, sessionID, relation, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read Session %s relationships: %w", relation, err)
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT to_key FROM blackboard_v2_session_relationships
-			WHERE session_id=? AND from_key=? AND relation=? ORDER BY to_key ASC`, sessionID, key, relation)
-		if err != nil {
-			return false, fmt.Errorf("read Session %s relationships: %w", relation, err)
-		}
-		for rows.Next() {
-			var target string
-			if err := rows.Scan(&target); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan Session %s relationships: %w", relation, err)
-			}
-			stack = append(stack, target)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate Session %s relationships: %w", relation, err)
-		}
-		if err := rows.Close(); err != nil {
-			return false, fmt.Errorf("close Session %s relationships: %w", relation, err)
-		}
-	}
-	return false, nil
+	return cycle != 0, nil
 }
 
 func sessionFactSupportsWouldCycle(ctx context.Context, tx *sql.Tx, sessionID, fromKey, toKey string) (bool, error) {
 	if fromKey == toKey {
 		return true, nil
 	}
-	visited := map[string]bool{}
-	stack := []string{toKey}
-	for len(stack) != 0 {
-		key := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if key == fromKey {
-			return true, nil
-		}
-		if visited[key] {
-			continue
-		}
-		visited[key] = true
-		rows, err := tx.QueryContext(ctx, `
-			SELECT rel.to_key
-			FROM blackboard_v2_session_relationships AS rel
-			JOIN blackboard_v2_session_records AS source
-			  ON source.session_id=rel.session_id AND source.key=rel.from_key AND source.type='fact'
-			JOIN blackboard_v2_session_records AS target
-			  ON target.session_id=rel.session_id AND target.key=rel.to_key AND target.type='fact'
-			WHERE rel.session_id=? AND rel.from_key=? AND rel.relation='supports'
-			ORDER BY rel.to_key ASC`, sessionID, key)
-		if err != nil {
-			return false, fmt.Errorf("read Session Fact supports relationships: %w", err)
-		}
-		for rows.Next() {
-			var target string
-			if err := rows.Scan(&target); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scan Session Fact supports relationship: %w", err)
-			}
-			stack = append(stack, target)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("iterate Session Fact supports relationships: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return false, fmt.Errorf("close Session Fact supports relationships: %w", err)
-		}
+	var cycle int
+	err := tx.QueryRowContext(ctx, `WITH RECURSIVE reachable(key) AS (
+  SELECT ?
+  UNION
+  SELECT rel.to_key FROM blackboard_v2_session_relationships rel
+  JOIN reachable ON rel.from_key=reachable.key
+  JOIN blackboard_v2_session_records source
+   ON source.session_id=rel.session_id AND source.key=rel.from_key AND source.type='fact'
+  JOIN blackboard_v2_session_records target
+   ON target.session_id=rel.session_id AND target.key=rel.to_key AND target.type='fact'
+  WHERE rel.session_id=? AND rel.relation='supports'
+ ) SELECT EXISTS(SELECT 1 FROM reachable WHERE key=?)`, toKey, sessionID, fromKey).Scan(&cycle)
+	if err != nil {
+		return false, fmt.Errorf("read Session Fact supports relationships: %w", err)
 	}
-	return false, nil
+	return cycle != 0, nil
 }
 
 func sessionHasIncomingSatisfies(ctx context.Context, tx *sql.Tx, sessionID, objectiveKey string) (bool, error) {
