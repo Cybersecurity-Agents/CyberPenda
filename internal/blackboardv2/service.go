@@ -1140,8 +1140,8 @@ func (s *Service) apply(ctx context.Context, projectID, continuationID string, b
 	}
 	s.writeMu.Unlock()
 	writeLocked = false
-	if workingAdvanced {
-		if s.publicationFail != nil {
+	if continuationID != "" {
+		if workingAdvanced && s.publicationFail != nil {
 			if err := s.publicationFail(SnapshotPublicationAfterCommit, continuationID); err != nil {
 				return ChangeResult{}, err
 			}

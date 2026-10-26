@@ -57,3 +57,25 @@ func TestRestorePriorWorkingSnapshotFilePreservesExactBytesAndAbsence(t *testing
 		t.Fatalf("restore of absent prior should remove Working Snapshot: %v", err)
 	}
 }
+
+func TestMatchingWorkingSnapshotRetriesFailedDirectorySync(t *testing.T) {
+	root := t.TempDir()
+	data := []byte(`{"revision":1}`)
+	if err := materializeWorkingSnapshot(root, "task-sync-retry", data); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	syncDir := func(*os.Root) error {
+		calls++
+		if calls == 1 {
+			return errors.New("directory sync failed after rename")
+		}
+		return nil
+	}
+	if workingSnapshotMatchesWithSync(root, "task-sync-retry", data, syncDir) {
+		t.Fatal("matching bytes hid a directory sync failure")
+	}
+	if !workingSnapshotMatchesWithSync(root, "task-sync-retry", data, syncDir) || calls != 2 {
+		t.Fatalf("directory sync not retried: %d", calls)
+	}
+}
