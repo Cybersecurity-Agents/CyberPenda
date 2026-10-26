@@ -33,11 +33,14 @@ const (
 // Losing persistent session ownership is never reported as live (orphaned
 // while durable-active). One-shot runs may be live from harness ownership.
 func (server *Server) computeRuntimeActivity(found task.Task) task.RuntimeActivity {
+	return server.computeRuntimeActivityWithExpectation(found, server.taskExpectsProviderSession(found))
+}
+
+func (server *Server) computeRuntimeActivityWithExpectation(found task.Task, expectsSession bool) task.RuntimeActivity {
 	taskID := strings.TrimSpace(found.ID)
 	durableActive := durableTaskActive(found.Status)
 	session, bound := server.providerSessions.get(taskID)
 	harnessActive := server.harness != nil && server.harness.IsActive(taskID)
-	expectsSession := server.taskExpectsProviderSession(found)
 
 	if bound {
 		if sessionHealthUnknown(session) {
@@ -286,4 +289,47 @@ func (server *Server) attachRuntimeActivity(found task.Task) task.Task {
 	found, activity = server.reconcileRuntimeActivity(found, activity)
 	found.RuntimeActivity = activity
 	return found
+}
+
+// attachRuntimeActivities resolves saved Runtime configuration once per batch.
+// Bound sessions and Harness health remain the Runtime Activity authority.
+func (server *Server) attachRuntimeActivities(tasks []task.Task) []task.Task {
+	if server.providerSessionFactory == nil {
+		for index := range tasks {
+			tasks[index] = server.attachRuntimeActivity(tasks[index])
+		}
+		return tasks
+	}
+	ids := make([]string, 0, len(tasks))
+	for _, found := range tasks {
+		ids = append(ids, found.ID)
+	}
+	configs, err := server.tasks.LatestRuntimeConfigs(ids)
+	if err != nil {
+		// Preserve the existing best-effort activity behavior on a database error.
+		for index := range tasks {
+			tasks[index] = server.attachRuntimeActivity(tasks[index])
+		}
+		return tasks
+	}
+	for index, found := range tasks {
+		provider := runtimeprofile.Provider(strings.TrimSpace(found.RuntimeControls.RuntimeProvider))
+		if provider == "" && found.ActiveContinuation != nil {
+			provider = runtimeprofile.Provider(strings.TrimSpace(found.ActiveContinuation.RuntimeProvider))
+		}
+		if provider == "" && found.LatestContinuation != nil {
+			provider = runtimeprofile.Provider(strings.TrimSpace(found.LatestContinuation.RuntimeProvider))
+		}
+		if provider == "" {
+			if profile, err := runtimeProfileFromSnapshot(configs[found.ID]); err == nil {
+				provider = profile.Provider
+			}
+		}
+		_, bound := server.providerSessions.get(found.ID)
+		activity := server.computeRuntimeActivityWithExpectation(found, bound || supportsPersistentProviderSession(found.Runner, provider))
+		found, activity = server.reconcileRuntimeActivity(found, activity)
+		found.RuntimeActivity = activity
+		tasks[index] = found
+	}
+	return tasks
 }

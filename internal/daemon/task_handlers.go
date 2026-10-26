@@ -1254,9 +1254,7 @@ func (server *Server) handleListTasks(response http.ResponseWriter, request *htt
 		tasks = []task.Task{}
 	}
 	// Decorate list entries with current Runtime Activity (not Task status).
-	for index := range tasks {
-		tasks[index] = server.attachRuntimeActivity(tasks[index])
-	}
+	tasks = server.attachRuntimeActivities(tasks)
 	writeJSON(response, http.StatusOK, struct {
 		Tasks []task.Task `json:"tasks"`
 	}{
@@ -1396,9 +1394,7 @@ func (server *Server) handleWorkspaceNavigation(response http.ResponseWriter, re
 		}
 		// Decorate each inlined Task through the same path as the per-Project
 		// Task list so runtime_activity is live and consistent.
-		for index := range inlined {
-			inlined[index] = server.attachRuntimeActivity(inlined[index])
-		}
+		inlined = server.attachRuntimeActivities(inlined)
 		summaries = append(summaries, workspaceNavigationProject{
 			Project:        current,
 			LastActivityAt: workspaceProjectActivity(current, inlined),
