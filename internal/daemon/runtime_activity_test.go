@@ -645,3 +645,27 @@ func TestRuntimeActivityNoExtraAuditRecords(t *testing.T) {
 	}
 	close(closed)
 }
+
+func TestRuntimeActivityBatchUsesSavedProviderWithoutDecoratedControls(t *testing.T) {
+	session := fakeprovider.New(fakeprovider.Config{SessionID: "batch-lost", Capabilities: runtimeplugin.Capabilities{PersistentSession: true, SendTurn: true, InterruptThenReplace: true}})
+	closed := make(chan struct{})
+	defer close(closed)
+	adapter := runtime.NewProviderSessionRunAdapter(session, closed)
+	factory := &activitySessionFactory{session: session, adapter: adapter, provider: runtimeprofile.ProviderCodex}
+	server, created, _ := newRuntimeActivityFixture(t, runtimeprofile.ProviderCodex, task.RunnerSandbox, factory)
+	launchActivityTask(t, server, created)
+	_ = server.providerSessions.remove(created.ID)
+	// List rows have neither decorated Controls nor Continuation metadata. The
+	// saved valid Snapshot must still distinguish persistent Runtime ownership.
+	found, err := server.tasks.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.RuntimeControls.RuntimeProvider != "" || found.LatestContinuation != nil {
+		t.Fatal("expected undecorated Task")
+	}
+	got := server.attachRuntimeActivities([]task.Task{found})
+	if got[0].RuntimeActivity.Liveness != runtimeLivenessOrphaned || got[0].Status != task.StatusInterrupted {
+		t.Fatalf("lost persistent ownership = %#v", got[0])
+	}
+}
