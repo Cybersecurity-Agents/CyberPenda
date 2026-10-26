@@ -231,14 +231,10 @@ func (server *Server) handleListSessions(response http.ResponseWriter, request *
 			}
 		}
 	}
-	decorated := make([]session.Session, 0, len(found))
-	for _, item := range found {
-		projected, decorateErr := server.decorateSession(item)
-		if decorateErr != nil {
-			writeSessionError(response, decorateErr)
-			return
-		}
-		decorated = append(decorated, projected)
+	decorated, decorateErr := server.decorateSessions(found)
+	if decorateErr != nil {
+		writeSessionError(response, decorateErr)
+		return
 	}
 	if limit > 0 {
 		sort.SliceStable(decorated, func(i, j int) bool {
