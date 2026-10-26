@@ -1232,6 +1232,10 @@ func CodexChecklist() string {
 // workingSnapshotMatches is only an optimization. Any missing, unsafe, or
 // unreadable path goes through the existing confined publication path.
 func workingSnapshotMatches(runtimeRoot, taskID string, data []byte) bool {
+	return workingSnapshotMatchesWithSync(runtimeRoot, taskID, data, syncEvidenceDirectory)
+}
+
+func workingSnapshotMatchesWithSync(runtimeRoot, taskID string, data []byte, syncDirectory func(*os.Root) error) bool {
 	root, err := os.OpenRoot(runtimeRoot)
 	if err != nil {
 		return false
@@ -1266,5 +1270,7 @@ func workingSnapshotMatches(runtimeRoot, taskID string, data []byte) bool {
 	}
 	defer file.Close()
 	existing, err := io.ReadAll(io.LimitReader(file, int64(len(data))+1))
-	return err == nil && bytes.Equal(existing, data)
+	// A prior rename may have succeeded before directory sync failed. Matching
+	// bytes do not prove that publication was durable, so retry directory sync.
+	return err == nil && bytes.Equal(existing, data) && syncDirectory(current) == nil
 }
