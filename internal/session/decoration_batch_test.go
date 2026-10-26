@@ -62,3 +62,29 @@ func TestDecorationDataForOwnersKeepsLatestAndOwnerBoundaries(t *testing.T) {
 		t.Fatalf("empty = %#v,%v", empty, err)
 	}
 }
+
+func TestDecorationDataForOwnersDoesNotOpenAnImmediateWriteTransaction(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "sessions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := NewService(db, filepath.Join(t.TempDir(), "sessions"))
+	found, err := s.Create(CreateRequest{Input: "read-only projection"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The Store uses _txlock=immediate even for ordinary Begin calls. A read-only
+	// projection must run while this connection rejects write transactions.
+	if _, err = db.Exec(`PRAGMA query_only=ON`); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec(`PRAGMA query_only=OFF`)
+	got, err := s.DecorationDataForOwners([]string{found.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("projection = %#v", got)
+	}
+}

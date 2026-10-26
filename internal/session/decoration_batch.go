@@ -29,11 +29,8 @@ func (s *Service) DecorationDataForOwners(sessionIDs []string) (map[string]Decor
 	if len(ids) == 0 {
 		return result, nil
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
+	// Each statement releases the Store's single connection. Do not wrap this
+	// read projection in a transaction: Store Begin uses an immediate write lock.
 	for offset := 0; offset < len(ids); offset += 500 {
 		end := min(offset+500, len(ids))
 		args := make([]any, 0, end-offset)
@@ -42,7 +39,7 @@ func (s *Service) DecorationDataForOwners(sessionIDs []string) (map[string]Decor
 		}
 		placeholders := strings.TrimSuffix(strings.Repeat("(?),", len(args)), ",")
 		requested := `WITH requested(id) AS (VALUES ` + placeholders + `) `
-		rows, err := tx.Query(requested+`SELECT id,session_id,number,runtime_profile_id,runtime_provider,runner,status,container_id,native_session_id,native_session_path,runtime_config_version_id,started_at,updated_at,ended_at
+		rows, err := s.db.Query(requested+`SELECT id,session_id,number,runtime_profile_id,runtime_provider,runner,status,container_id,native_session_id,native_session_path,runtime_config_version_id,started_at,updated_at,ended_at
    FROM session_continuations WHERE id IN (
     SELECT (SELECT id FROM session_continuations WHERE session_id=requested.id ORDER BY number DESC LIMIT 1) FROM requested
     UNION
@@ -73,7 +70,7 @@ func (s *Service) DecorationDataForOwners(sessionIDs []string) (map[string]Decor
 		if err != nil {
 			return nil, err
 		}
-		rows, err = tx.Query(requested+`SELECT session_id,config_json FROM session_runtime_config_versions WHERE id IN (
+		rows, err = s.db.Query(requested+`SELECT session_id,config_json FROM session_runtime_config_versions WHERE id IN (
    SELECT (SELECT id FROM session_runtime_config_versions WHERE session_id=requested.id ORDER BY version DESC LIMIT 1) FROM requested
   )`, args...)
 		if err != nil {
@@ -97,7 +94,7 @@ func (s *Service) DecorationDataForOwners(sessionIDs []string) (map[string]Decor
 		if err != nil {
 			return nil, err
 		}
-		rows, err = tx.Query(`SELECT id,session_id,seq,kind,payload_json,created_at FROM session_events
+		rows, err = s.db.Query(`SELECT id,session_id,seq,kind,payload_json,created_at FROM session_events
    WHERE session_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")+`)
    AND kind IN ('permission','lifecycle')
    AND json_extract(payload_json,'$.permission_request_id') IS NOT NULL

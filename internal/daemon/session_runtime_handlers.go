@@ -881,6 +881,7 @@ func (server *Server) decorateSession(found session.Session) (session.Session, e
 
 func (server *Server) decorateSessionFromData(found session.Session, data session.DecorationData, steeringControl steeringControlProjection) (session.Session, error) {
 	active, latest := data.Active, data.Latest
+	snapshot, snapshotErr := decodeRuntimeSnapshot(data.Config)
 	found.ActiveContinuation, found.LatestContinuation = active, latest
 	provider := ""
 	if latest != nil {
@@ -922,7 +923,11 @@ func (server *Server) decorateSessionFromData(found session.Session, data sessio
 	controls.QueueSteerAvailable = controls.QueueSteerAvailable && runtimeSupported
 	if latest != nil {
 		controls.NativeSessionCaptured = latest.NativeSessionID != "" || latest.NativeSessionPath != ""
-		profile, selectionErr := runtimeProfileFromSnapshot(data.Config)
+		selectionErr := snapshotErr
+		profile := runtimeprofile.Profile{}
+		if selectionErr == nil {
+			profile, selectionErr = runtimeProfileFromDecodedSnapshot(snapshot)
+		}
 		selection := runtime.ProviderSessionRequest{}
 		if selectionErr == nil {
 			selection, selectionErr = sessionSelection(profile, data.Config, sessionRuntimeInput{})
@@ -965,7 +970,7 @@ func (server *Server) decorateSessionFromData(found session.Session, data sessio
 	}
 	controls.ProviderPermissions = sessionProviderPermissionsFromEvents(data.PermissionEvents)
 	found.RuntimeControls = controls
-	if snapshot, snapshotErr := decodeRuntimeSnapshot(data.Config); snapshotErr == nil {
+	if snapshotErr == nil {
 		summary := runtimeconfig.Summarize(snapshot)
 		found.RuntimeConfiguration = &summary
 	}
