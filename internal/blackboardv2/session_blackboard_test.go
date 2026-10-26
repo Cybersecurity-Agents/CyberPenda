@@ -223,17 +223,20 @@ func TestSessionBlackboardContinuationPinsWorkingSnapshotAndFinishesOnlyContinua
 		t.Fatalf("Session pin after write = %#v", updatedPin)
 	}
 
-	baseOne := 1
-	second, err := board.ApplyForSessionContinuationAtRevision(ctx, created.ID, continuation.ID, baseOne, blackboardv2.ChangeBatch{
+	second, err := board.ApplyForSessionAuthority(ctx, authority, blackboardv2.ChangeBatch{
 		Schema: "semantic-change-batch/v2", IdempotencyKey: "continuation-update",
 		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Type: "fact", Version: 1, Record: blackboardv2.FactPatch{
 			Summary: stringPtr("Updated pinned Session state"),
 		}}},
 	})
 	if err != nil || second.Revision != 2 {
-		t.Fatalf("Session Continuation revisioned write = %#v, %v", second, err)
+		t.Fatalf("Session Continuation second write = %#v, %v", second, err)
 	}
-	if _, err := board.ApplyForSessionContinuationAtRevision(ctx, created.ID, continuation.ID, 1, blackboardv2.ChangeBatch{
+	secondPin, err := board.ReadSessionContinuationPin(ctx, created.ID, continuation.ID)
+	if err != nil || secondPin.Launch.Revision != 0 || secondPin.Working.Revision != 2 {
+		t.Fatalf("Session pin after second write = %#v, %v", secondPin, err)
+	}
+	if _, err := board.ApplyForOwnerAtRevision(ctx, created.OwnerContract(), 1, blackboardv2.ChangeBatch{
 		Schema: "semantic-change-batch/v2", IdempotencyKey: "continuation-stale",
 		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Type: "fact", Version: 2, Record: blackboardv2.FactPatch{
 			Summary: stringPtr("stale"),
@@ -241,9 +244,18 @@ func TestSessionBlackboardContinuationPinsWorkingSnapshotAndFinishesOnlyContinua
 	}); !isSessionSemanticCode(err, "version_conflict") {
 		t.Fatalf("stale Session Continuation write = %v, want version_conflict", err)
 	}
+	third, err := board.ApplyForOwnerAtRevision(ctx, created.OwnerContract(), 2, blackboardv2.ChangeBatch{
+		Schema: "semantic-change-batch/v2", IdempotencyKey: "owner-revisioned",
+		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Type: "fact", Version: 2, Record: blackboardv2.FactPatch{
+			Summary: stringPtr("Owner revisioned write"),
+		}}},
+	})
+	if err != nil || third.Revision != 3 {
+		t.Fatalf("revisioned Session write = %#v, %v", third, err)
+	}
 
 	finished, err := board.FinishSessionAuthority(ctx, authority, "continuation-finish")
-	if err != nil || finished.Revision != 2 {
+	if err != nil || finished.Revision != 3 {
 		t.Fatalf("finish Session Continuation = %#v, %v", finished, err)
 	}
 	replay, err := board.FinishSessionContinuation(ctx, created.ID, continuation.ID, "continuation-finish")
@@ -255,7 +267,7 @@ func TestSessionBlackboardContinuationPinsWorkingSnapshotAndFinishesOnlyContinua
 	}
 	if _, err := board.ApplyForSessionContinuation(ctx, created.ID, continuation.ID, blackboardv2.ChangeBatch{
 		Schema: "semantic-change-batch/v2", IdempotencyKey: "after-finish",
-		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Version: 2, Type: "fact", Record: blackboardv2.FactPatch{
+		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Version: 3, Type: "fact", Record: blackboardv2.FactPatch{
 			Summary: stringPtr("must be rejected"),
 		}}},
 	}); !isSessionSemanticCode(err, "closed_continuation") {
@@ -269,12 +281,12 @@ func TestSessionBlackboardContinuationPinsWorkingSnapshotAndFinishesOnlyContinua
 		t.Fatalf("rebind Session Continuation: %v", err)
 	}
 	rebound, err := board.ReadSessionContinuationPin(ctx, created.ID, replacement.ID)
-	if err != nil || rebound.Launch.Revision != 0 || rebound.Working.Revision != 2 || string(rebound.Launch.Bytes) == string(rebound.Working.Bytes) {
+	if err != nil || rebound.Launch.Revision != 0 || rebound.Working.Revision != 3 || string(rebound.Launch.Bytes) == string(rebound.Working.Bytes) {
 		t.Fatalf("rebound Session pin = %#v, %v", rebound, err)
 	}
 	if _, err := board.ApplyForSessionContinuation(ctx, created.ID, replacement.ID, blackboardv2.ChangeBatch{
 		Schema: "semantic-change-batch/v2", IdempotencyKey: "replacement-update",
-		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Version: 2, Type: "fact", Record: blackboardv2.FactPatch{
+		Changes: []blackboardv2.Change{{Op: "update", Key: "fact:continuity", Version: 3, Type: "fact", Record: blackboardv2.FactPatch{
 			Summary: stringPtr("Updated by replacement Continuation"),
 		}}},
 	}); err != nil {
