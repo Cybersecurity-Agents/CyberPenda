@@ -40,13 +40,14 @@ const (
 
 // Service applies and reads Blackboard v2 semantic state for one Project.
 type Service struct {
-	db              *store.DB
-	evidenceConfig  EvidenceConfig
-	runtimeRoot     string
-	writeMu         sync.Mutex
-	snapshotMu      sync.Mutex
-	finishFail      FinishFailureInjector
-	publicationFail SnapshotPublicationInjector
+	db               *store.DB
+	evidenceConfig   EvidenceConfig
+	evidenceVerified evidenceVerificationCache
+	runtimeRoot      string
+	writeMu          sync.Mutex
+	snapshotMu       sync.Mutex
+	finishFail       FinishFailureInjector
+	publicationFail  SnapshotPublicationInjector
 }
 
 type SnapshotPublicationPoint string
